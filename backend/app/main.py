@@ -19,6 +19,8 @@ from .schemas import (
     AnalyzeResponse,
     AttributionRequest,
     AttributionResponse,
+    BehaviorRequest,
+    BehaviorResponse,
     CompareRequest,
     CompareResponse,
     LensRequest,
@@ -136,6 +138,24 @@ def post_attribution(request: AttributionRequest) -> AttributionResponse:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except inference.AblationUnsupportedError as exc:
         raise HTTPException(status_code=501, detail=str(exc)) from exc
+    except inference.ModelLoadError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@app.post("/behavior", response_model=BehaviorResponse)
+def post_behavior(request: BehaviorRequest) -> BehaviorResponse:
+    """Generate real continuations for many prompts and diff two checkpoints."""
+    try:
+        return inference.behavior(
+            request.model_id,
+            request.prompts,
+            compare_model_id=request.compare_model_id,
+            max_new_tokens=request.max_new_tokens,
+        )
+    except models.UnknownModelError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except inference.EmptyPromptError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except inference.ModelLoadError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 

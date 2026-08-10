@@ -12,6 +12,8 @@ import type {
   AnalyzeResponse,
   AttributionRequest,
   AttributionResponse,
+  BehaviorRequest,
+  BehaviorResponse,
   CompareRequest,
   CompareResponse,
   LensRequest,
@@ -103,6 +105,11 @@ export function ablate(body: AblateRequest): Promise<AblateResponse> {
 /** POST /attribution — ablate every block, or every head in one block, ranked by effect. */
 export function attribution(body: AttributionRequest): Promise<AttributionResponse> {
   return post<AttributionResponse>('/attribution', body)
+}
+
+/** POST /behavior — real generated text for many prompts, diffed between two models. */
+export function behavior(body: BehaviorRequest): Promise<BehaviorResponse> {
+  return post<BehaviorResponse>('/behavior', body)
 }
 
 /** POST /compare — two models on one prompt, plus their per-layer delta. */

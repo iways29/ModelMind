@@ -353,3 +353,89 @@ class AttributionResponse(Schema):
     narration: List[str]
     truncated: bool
     prompt_notice: Optional[str] = None
+
+
+# --------------------------------------------------------------------------
+# Behavior — many prompts, real generated text, diffed between two checkpoints
+# --------------------------------------------------------------------------
+
+
+class BehaviorRequest(Schema):
+    model_id: str
+    compare_model_id: Optional[str] = Field(
+        None,
+        description="Second checkpoint to diff against. Omit to just read one model's output.",
+    )
+    prompts: List[str] = Field(
+        ...,
+        min_length=1,
+        max_length=25,
+        description="One prompt per row. Capped because generation is CPU-bound.",
+    )
+    max_new_tokens: int = Field(20, ge=4, le=48)
+
+
+class Continuation(Schema):
+    """What one model actually wrote after the prompt."""
+
+    model_id: str
+    display_name: str
+    text: str = Field(..., description="Generated continuation only, without the prompt.")
+    repeats: bool = Field(
+        ...,
+        description=(
+            "True if the continuation falls into a repetition loop. Greedy decoding does "
+            "this readily, and it is the most common way a small model's output goes bad."
+        ),
+    )
+
+
+class Divergence(Schema):
+    """The first token where the two models part ways."""
+
+    index: int = Field(..., description="Position within the generated continuation, 0-based.")
+    shared_prefix: str = Field(
+        ..., description="Prompt plus the continuation both models agreed on, up to this point."
+    )
+    prefix_token_count: int = Field(
+        ...,
+        description=(
+            "Tokens in `shared_prefix`. The lens reads out the last one, so this is the "
+            "position to open the microscope at."
+        ),
+    )
+    token: TokenPrediction = Field(..., description="What the first model chose here.")
+    compare_token: TokenPrediction = Field(..., description="What the second model chose instead.")
+
+
+class PromptBehavior(Schema):
+    """One prompt, run through both models."""
+
+    prompt: str
+    primary: Continuation
+    compare: Optional[Continuation] = None
+    identical: bool = Field(
+        ..., description="True when both models produced exactly the same continuation."
+    )
+    divergence: Optional[Divergence] = None
+    surprise_bits: Optional[float] = Field(
+        None,
+        description=(
+            "Average bits the FIRST model assigns to the SECOND model's continuation. High "
+            "means the fine-tune went somewhere the base would not have — the single best "
+            "scalar for 'how far did this drift'."
+        ),
+    )
+    flags: List[str] = Field(
+        ..., description="Short machine-checkable labels: 'identical', 'repeats', 'drifted'."
+    )
+
+
+class BehaviorResponse(Schema):
+    model_id: str
+    display_name: str
+    compare_model_id: Optional[str] = None
+    compare_display_name: Optional[str] = None
+    rows: List[PromptBehavior]
+    max_new_tokens: int
+    narration: List[str]

@@ -205,6 +205,57 @@ export interface AttributionResponse {
   prompt_notice: string | null
 }
 
+/** Mirrors `BehaviorRequest`. Omit `compare_model_id` to just read one model. */
+export interface BehaviorRequest {
+  model_id: string
+  compare_model_id?: string
+  prompts: string[]
+  max_new_tokens?: number
+}
+
+/** Mirrors `Continuation` — what one model actually wrote after the prompt. */
+export interface Continuation {
+  model_id: string
+  display_name: string
+  /** Generated text only, prompt excluded. */
+  text: string
+  /** True when the continuation falls into a repetition loop. */
+  repeats: boolean
+}
+
+/** Mirrors `Divergence` — the first token where the two models part ways. */
+export interface Divergence {
+  index: number
+  shared_prefix: string
+  /** Token count of `shared_prefix`; the position to open the lens at. */
+  prefix_token_count: number
+  token: TokenPrediction
+  compare_token: TokenPrediction
+}
+
+/** Mirrors `PromptBehavior`. */
+export interface PromptBehavior {
+  prompt: string
+  primary: Continuation
+  compare: Continuation | null
+  identical: boolean
+  divergence: Divergence | null
+  /** Avg bits the first model assigns the second's text. Higher = drifted further. */
+  surprise_bits: number | null
+  flags: string[]
+}
+
+/** Mirrors `BehaviorResponse`. */
+export interface BehaviorResponse {
+  model_id: string
+  display_name: string
+  compare_model_id: string | null
+  compare_display_name: string | null
+  rows: PromptBehavior[]
+  max_new_tokens: number
+  narration: string[]
+}
+
 /** Mirrors `CompareRequest`. */
 export interface CompareRequest {
   base_model_id: string

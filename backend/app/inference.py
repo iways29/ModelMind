@@ -5,6 +5,7 @@ routes call into these functions and do nothing else.
 """
 
 import logging
+import math
 import os
 import threading
 import unicodedata
@@ -15,7 +16,7 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tupl
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
 
-from .insights import narrate_ablation, narrate_attribution, narrate_lens
+from .insights import narrate_ablation, narrate_attribution, narrate_behavior, narrate_lens
 from .models import ModelInfo, get_model
 from .schemas import (
     Ablation,
@@ -23,12 +24,16 @@ from .schemas import (
     AblationEffect,
     AnalyzeResponse,
     AttributionResponse,
+    BehaviorResponse,
     CompareResponse,
     ComponentEffect,
+    Continuation,
+    Divergence,
     LayerLens,
     LensResponse,
     LensTrace,
     ModelMagnitudes,
+    PromptBehavior,
     TokenPrediction,
     TokenShift,
     TokenTrajectory,
@@ -835,4 +840,250 @@ def attribution(
         ),
         truncated=prepared.truncated,
         prompt_notice=prepared.notice,
+    )
+
+
+# --------------------------------------------------------------------------
+# Behavior — what the model actually writes, across many prompts
+#
+# Everything above this line reads a single forward pass. This section is the
+# only place the model generates text, and it is the entry point the rest of the
+# tool was missing: you cannot ask "where did my model go wrong" until you have
+# seen it go wrong somewhere.
+# --------------------------------------------------------------------------
+
+# Greedy decoding, always. Sampling would mean two runs of the *same* model
+# disagree, and then a diff between two checkpoints measures nothing.
+_GENERATION_IS_GREEDY = True
+
+# A 4-token window repeated this many times is a degeneration loop rather than
+# ordinary English repetition.
+_REPEAT_WINDOW = 4
+_REPEAT_THRESHOLD = 3
+
+# "Drifted" is relative to the rest of the run, not an absolute bit count. An
+# absolute threshold is unusable here: surprise depends on prompt length, domain,
+# and how far apart the two checkpoints are, so any constant is either never hit
+# or always hit. A row is flagged when it is this many times the run's median.
+_DRIFT_RATIO = 1.25
+
+
+def _encode_prompt(loaded: LoadedModel, prompt: str) -> List[int]:
+    """Clean, encode, and truncate one prompt to the server's token ceiling."""
+    cleaned, _ = _clean_prompt(prompt)
+    ids = loaded.tokenizer.encode(cleaned)[:MAX_PROMPT_TOKENS]
+    if not ids:
+        raise EmptyPromptError(f"Prompt {prompt!r} tokenized to zero tokens.")
+    return ids
+
+
+def _generate_batch(
+    loaded: LoadedModel, id_lists: Sequence[List[int]], max_new_tokens: int
+) -> List[List[int]]:
+    """Greedy-generate a continuation for each prompt, in one batched pass.
+
+    Padding is on the LEFT and built by hand rather than via the tokenizer.
+    Decoder-only models continue from the last position, so right-padding would
+    have them continue from pad tokens instead of from the prompt — and building
+    the batch here avoids mutating `padding_side` on a cached, shared tokenizer.
+    """
+    pad_id = loaded.tokenizer.eos_token_id
+    width = max(len(ids) for ids in id_lists)
+
+    input_ids = torch.full((len(id_lists), width), pad_id, dtype=torch.long, device=DEVICE)
+    attention_mask = torch.zeros((len(id_lists), width), dtype=torch.long, device=DEVICE)
+    for row, ids in enumerate(id_lists):
+        input_ids[row, width - len(ids) :] = torch.tensor(ids, dtype=torch.long, device=DEVICE)
+        attention_mask[row, width - len(ids) :] = 1
+
+    with torch.no_grad():
+        generated = loaded.model.generate(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=max_new_tokens,
+            do_sample=not _GENERATION_IS_GREEDY,
+            pad_token_id=pad_id,
+            # The checkpoints are loaded with output_attentions/hidden_states on
+            # for the lens. Some generation configs pick those up and switch to
+            # returning a ModelOutput instead of a plain tensor — iterating that
+            # yields field *names*. Pin the return type rather than sniff it.
+            return_dict_in_generate=False,
+        )
+    sequences = generated if isinstance(generated, torch.Tensor) else generated.sequences
+
+    continuations: List[List[int]] = []
+    for row in sequences:
+        ids = row[width:].tolist()
+        # Everything at and after the first EOS is padding, not output.
+        if pad_id in ids:
+            ids = ids[: ids.index(pad_id)]
+        continuations.append(ids)
+    return continuations
+
+
+def _repeats(token_ids: Sequence[int]) -> bool:
+    """True if the continuation has fallen into a repetition loop."""
+    if len(token_ids) < _REPEAT_WINDOW * _REPEAT_THRESHOLD:
+        return False
+    seen: Dict[Tuple[int, ...], int] = {}
+    for start in range(len(token_ids) - _REPEAT_WINDOW + 1):
+        window = tuple(token_ids[start : start + _REPEAT_WINDOW])
+        seen[window] = seen.get(window, 0) + 1
+        if seen[window] >= _REPEAT_THRESHOLD:
+            return True
+    return False
+
+
+def _divergence_index(a: Sequence[int], b: Sequence[int]) -> Optional[int]:
+    """First position where two continuations differ, or None if one prefixes the other."""
+    for index, (left, right) in enumerate(zip(a, b)):
+        if left != right:
+            return index
+    return None
+
+
+def _next_token_at(loaded: LoadedModel, ids: Sequence[int]) -> TokenPrediction:
+    """What this model predicts after `ids`, and how sure it is."""
+    tensor = torch.tensor([list(ids)], dtype=torch.long, device=DEVICE)
+    probs = _final_probs(_run(loaded, tensor, internals=False), len(ids) - 1)
+    top = int(torch.argmax(probs).item())
+    return TokenPrediction(
+        token=_display_token(loaded.tokenizer, top),
+        token_id=top,
+        prob=round(float(probs[top].item()), 6),
+    )
+
+
+def _surprise_bits(
+    loaded: LoadedModel, prompt_ids: Sequence[int], continuation_ids: Sequence[int]
+) -> Optional[float]:
+    """Average bits this model assigns to someone else's continuation.
+
+    Teacher-forced: we feed the other model's text through and ask how improbable
+    it was. High means the second model wrote something the first would never
+    have produced, which is exactly "how far did the fine-tune drift" as a single
+    number.
+    """
+    if not continuation_ids:
+        return None
+
+    ids = list(prompt_ids) + list(continuation_ids)
+    tensor = torch.tensor([ids], dtype=torch.long, device=DEVICE)
+    outputs = _run(loaded, tensor, internals=False)
+    log_probs = torch.log_softmax(outputs.logits[0].float(), dim=-1)
+
+    # Position i's logits predict token i+1, so the score for the first
+    # continuation token is read from the last prompt position.
+    start = len(prompt_ids)
+    total = sum(
+        float(log_probs[start + offset - 1, token_id].item())
+        for offset, token_id in enumerate(continuation_ids)
+    )
+    return round(-total / len(continuation_ids) / math.log(2), 4)
+
+
+def _continuation(loaded: LoadedModel, ids: Sequence[int]) -> Continuation:
+    return Continuation(
+        model_id=loaded.info.id,
+        display_name=loaded.info.display_name,
+        text=loaded.tokenizer.decode(list(ids)),
+        repeats=_repeats(ids),
+    )
+
+
+def _flag_drift(rows: List[PromptBehavior]) -> None:
+    """Mark the rows that moved furthest, judged against this run's own median.
+
+    Needs every row's score before it can flag any of them, so it runs as a
+    second pass rather than inline.
+    """
+    scores = sorted(r.surprise_bits for r in rows if r.surprise_bits is not None)
+    if len(scores) < 3:
+        return
+    median = scores[len(scores) // 2]
+    if median <= 0:
+        return
+    for row in rows:
+        if row.surprise_bits is not None and row.surprise_bits >= median * _DRIFT_RATIO:
+            row.flags.append("drifted")
+
+
+def behavior(
+    model_id: str,
+    prompts: Sequence[str],
+    compare_model_id: Optional[str] = None,
+    max_new_tokens: int = 20,
+) -> BehaviorResponse:
+    """Run many prompts through one or two checkpoints and diff what they write."""
+    primary = load_model(model_id)
+    other = load_model(compare_model_id) if compare_model_id else None
+
+    prompt_ids = [_encode_prompt(primary, prompt) for prompt in prompts]
+    cleaned = [primary.tokenizer.decode(ids) for ids in prompt_ids]
+
+    primary_out = _generate_batch(primary, prompt_ids, max_new_tokens)
+    compare_out = _generate_batch(other, prompt_ids, max_new_tokens) if other else None
+
+    rows: List[PromptBehavior] = []
+    for index, prompt in enumerate(cleaned):
+        mine = primary_out[index]
+        row_flags: List[str] = []
+
+        if compare_out is None:
+            if _repeats(mine):
+                row_flags.append("repeats")
+            rows.append(
+                PromptBehavior(
+                    prompt=prompt,
+                    primary=_continuation(primary, mine),
+                    identical=False,
+                    flags=row_flags,
+                )
+            )
+            continue
+
+        theirs = compare_out[index]
+        identical = mine == theirs
+
+        divergence: Optional[Divergence] = None
+        split = _divergence_index(mine, theirs)
+        if split is not None:
+            shared = prompt_ids[index] + mine[:split]
+            divergence = Divergence(
+                index=split,
+                shared_prefix=primary.tokenizer.decode(shared),
+                prefix_token_count=len(shared),
+                token=_next_token_at(primary, shared),
+                compare_token=_next_token_at(other, shared),
+            )
+
+        surprise = _surprise_bits(primary, prompt_ids[index], theirs)
+
+        if identical:
+            row_flags.append("identical")
+        if _repeats(mine) or _repeats(theirs):
+            row_flags.append("repeats")
+
+        rows.append(
+            PromptBehavior(
+                prompt=prompt,
+                primary=_continuation(primary, mine),
+                compare=_continuation(other, theirs),
+                identical=identical,
+                divergence=divergence,
+                surprise_bits=surprise,
+                flags=row_flags,
+            )
+        )
+
+    _flag_drift(rows)
+
+    return BehaviorResponse(
+        model_id=primary.info.id,
+        display_name=primary.info.display_name,
+        compare_model_id=other.info.id if other else None,
+        compare_display_name=other.info.display_name if other else None,
+        rows=rows,
+        max_new_tokens=max_new_tokens,
+        narration=narrate_behavior(rows, primary.info.display_name, other.info.display_name if other else None),
     )

@@ -15,6 +15,7 @@ from .schemas import (
     ComponentEffect,
     LayerLens,
     LensTrace,
+    PromptBehavior,
     TokenPrediction,
     TokenTrajectory,
 )
@@ -355,6 +356,98 @@ def narrate_attribution(
         )
 
     return findings
+
+
+# --------------------------------------------------------------------------
+# Behavior
+# --------------------------------------------------------------------------
+
+
+def narrate_behavior(
+    rows: List[PromptBehavior],
+    name: str,
+    compare_name: Optional[str],
+) -> List[str]:
+    """Summarise a whole run of prompts: what changed, what broke, where to look."""
+    if not rows:
+        return []
+
+    findings: List[str] = []
+    total = len(rows)
+
+    if compare_name is None:
+        looping = [r for r in rows if "repeats" in r.flags]
+        findings.append(
+            f"Generated {total} continuation{'s' if total != 1 else ''} from {name}, "
+            f"greedily — no sampling, so re-running gives byte-identical output."
+        )
+        if looping:
+            findings.append(
+                f"{len(looping)} of {total} fall into a repetition loop. Greedy decoding does "
+                f"this readily on small models; it is the single most common way output goes "
+                f"bad, and it is a decoding problem before it is a training problem."
+            )
+        findings.append(
+            "Add a second checkpoint to diff against and this view starts answering "
+            "*what changed*, not just *what it says*."
+        )
+        return findings
+
+    identical = [r for r in rows if r.identical]
+    changed = [r for r in rows if not r.identical]
+    findings.append(
+        f"{len(changed)} of {total} prompts produce different text under {compare_name} "
+        f"than under {name}. The other {len(identical)} are byte-identical."
+    )
+
+    if not changed:
+        findings.append(
+            f"On this set the two checkpoints are indistinguishable. That is a real result: "
+            f"either the fine-tune did not touch this kind of input, or these prompts are not "
+            f"the ones that would show it. Try prompts closer to what {compare_name} was tuned on."
+        )
+        return findings
+
+    early = [r for r in changed if r.divergence is not None and r.divergence.index == 0]
+    if early:
+        findings.append(
+            f"{len(early)} diverge on the very first generated word — the checkpoints disagree "
+            f"immediately rather than drifting apart. Those are the clearest cases to open in "
+            f"the lens, because the disagreement is not yet tangled up in different context."
+        )
+
+    drifted = sorted(
+        (r for r in changed if r.surprise_bits is not None),
+        key=lambda r: r.surprise_bits or 0,
+        reverse=True,
+    )
+    if drifted:
+        worst = drifted[0]
+        findings.append(
+            f'Furthest drift: "{_shorten(worst.prompt)}" — {name} finds {compare_name}\'s '
+            f"continuation {worst.surprise_bits:.1f} bits per token surprising. High values mean "
+            f"the fine-tune wrote something the base model would rarely have produced."
+        )
+
+    looping = [r for r in rows if "repeats" in r.flags]
+    if looping:
+        findings.append(
+            f"{len(looping)} of {total} contain a repetition loop in at least one model. That is "
+            f"a decoding artifact of greedy search, not evidence either checkpoint is broken — "
+            f"but it does make those rows hard to read as behaviour."
+        )
+
+    findings.append(
+        "Click any row to load that prompt into the lens and ablation views, positioned at the "
+        "token where the two models parted ways. That is the point where 'what changed' becomes "
+        "'which part of the network changed it'."
+    )
+    return findings
+
+
+def _shorten(text: str, limit: int = 42) -> str:
+    text = text.strip()
+    return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
 def _clean(token: str) -> str:

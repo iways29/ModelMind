@@ -61,6 +61,32 @@ in-memory cache and takes about a second.
 
 ## What each view shows
 
+**Behavior** — the entry point, and the only view that doesn't require you to
+already know which prompt is interesting. Give it a list of prompts, pick a
+second checkpoint, and it generates real continuations from both and shows you
+where they part ways.
+
+Decoding is greedy, never sampled. That is the whole reason a diff here means
+anything: with sampling, two runs of the *same* model disagree, and a comparison
+between two checkpoints would be measuring the dice rather than the weights.
+
+Rows are ranked by how far the second model drifted — measured as the average
+bits of surprise the first model assigns to the second's continuation, which is
+high exactly when the fine-tune wrote something the base would rarely produce.
+Rows are also flagged for repetition loops, which greedy decoding produces
+readily and which are the most common way a small model's output goes bad.
+
+The **Off-domain** suite is the one that earns its keep. Run it against
+`lvwerra/gpt2-imdb` and the fine-tune answers *"My review of the restaurant:"*
+with `"The best thing about this movie is…"` — it drags unrelated prompts back
+toward movie reviews. That damage is invisible if you only test on the domain a
+model was tuned for.
+
+**Inspect** on any row loads that prompt into the lens, cut at exactly the token
+where the two models disagreed, so the readout lands on the decision that
+differed. That is the hand-off from *what changed* to *which part of the network
+changed it*.
+
 **Watch it think** — the headline view. At every layer, the model's residual
 stream is pushed through its own final layer norm and unembedding matrix, which
 turns each layer into a readable next-token prediction. You watch the answer
@@ -147,6 +173,7 @@ covers the shared prefix and the response carries a note saying so.
 | `GET` | `/models` | — | `ModelInfo[]` |
 | `POST` | `/analyze` | `{model_id, prompt}` | `{tokens, attentions, hidden_state_magnitudes, …}` |
 | `POST` | `/lens` | `{model_id, prompt, top_k?}` | per-layer top-k predictions, gap-free `trajectories`, and `narration` |
+| `POST` | `/behavior` | `{model_id, prompts[], compare_model_id?}` | per-prompt continuations, divergence point, drift score |
 | `POST` | `/ablate` | `{model_id, prompt, ablations[]}` | `baseline` and `ablated` traces + an `effect` block |
 | `POST` | `/attribution` | `{model_id, prompt, scope, layer?}` | `components` ranked by `kl_bits` |
 | `POST` | `/compare` | `{base_model_id, finetuned_model_id, prompt}` | both profiles + per-layer `delta` |
@@ -179,6 +206,12 @@ changed without touching inference.
 Ablation hooks are installed by a context manager (`_ablated`) and torn down in
 a `finally`. The model is a process-wide cached singleton, so a hook that
 outlived its request would silently corrupt every later run.
+
+`/behavior` is the only endpoint that generates text. It batches with **left**
+padding built by hand: decoder-only models continue from the last position, so
+right-padding would have them continue from pad tokens, and building the batch
+in-place avoids mutating `padding_side` on a shared cached tokenizer. Batching
+is worth it — 0.16s per prompt against 0.44s one at a time.
 
 Response shapes are defined once in `backend/app/schemas.py` and mirrored by
 hand in `frontend/src/api/types.ts`. No codegen at this stage — change both in

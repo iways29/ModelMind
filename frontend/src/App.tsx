@@ -11,12 +11,16 @@ import type { AnalyzeResponse, LensResponse, ModelInfo } from './api/types'
 import AblationView from './components/AblationView'
 import ActivationChart from './components/ActivationChart'
 import AttentionHeatmap from './components/AttentionHeatmap'
+import BehaviorView from './components/BehaviorView'
 import CompareView from './components/CompareView'
 import LogitLens from './components/LogitLens'
 import ModelSelector from './components/ModelSelector'
 import { Button, ErrorNote, Note } from './components/ui'
 
+// Behavior comes first because it's the only view that works without already
+// knowing which prompt is interesting — it's how you find one for the rest.
 const TABS = [
+  { id: 'behavior', label: 'Behavior' },
   { id: 'lens', label: 'Watch it think' },
   { id: 'ablate', label: 'Ablate' },
   { id: 'attention', label: 'Attention' },
@@ -39,7 +43,7 @@ export default function App() {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
-  const [tab, setTab] = useState<TabId>('lens')
+  const [tab, setTab] = useState<TabId>('behavior')
 
   useEffect(() => {
     let cancelled = false
@@ -59,16 +63,22 @@ export default function App() {
 
   const canRun = Boolean(prompt.trim()) && Boolean(modelId) && !loading
 
-  async function run() {
-    if (!canRun) return
+  /**
+   * `promptOverride` exists for the Behavior tab's "Inspect" button, which needs
+   * to set a prompt and immediately run it. `setPrompt` won't have landed by the
+   * time this executes, so the value has to travel as an argument.
+   */
+  async function run(promptOverride?: string) {
+    const active = (promptOverride ?? prompt).trim()
+    if (!active || !modelId || loading) return
     setLoading(true)
     setError(null)
 
     // Both views come from one click. allSettled rather than all: a model that
     // can't be lensed should still render its attention and activations.
     const [analyzed, lensed] = await Promise.allSettled([
-      analyze({ model_id: modelId, prompt }),
-      lens({ model_id: modelId, prompt, top_k: 5 }),
+      analyze({ model_id: modelId, prompt: active }),
+      lens({ model_id: modelId, prompt: active, top_k: 5 }),
     ])
 
     if (analyzed.status === 'fulfilled') {
@@ -106,7 +116,7 @@ export default function App() {
                   value={prompt}
                   onChange={(event) => setPrompt(event.target.value)}
                   onKeyDown={(event) => {
-                    if (event.key === 'Enter') run()
+                    if (event.key === 'Enter') void run()
                   }}
                   placeholder={DEFAULT_PROMPT}
                   className="w-full rounded-lg border border-line-bright bg-raised px-3.5 py-2.5 font-mono text-[13px] text-ink placeholder:text-ink-faint/60 focus:border-base-accent/70 focus:ring-1 focus:ring-base-accent/25 focus:outline-none"
@@ -128,7 +138,7 @@ export default function App() {
                 <span aria-hidden className="font-mono text-[10px] tracking-[0.16em] uppercase opacity-0 select-none">
                   Run
                 </span>
-                <Button onClick={run} disabled={!canRun}>
+                <Button onClick={() => void run()} disabled={!canRun}>
                   {loading ? 'Running…' : 'Analyze'}
                 </Button>
               </div>
@@ -172,6 +182,17 @@ export default function App() {
             ))}
           </nav>
 
+          {tab === 'behavior' && (
+            <BehaviorView
+              models={models}
+              modelId={modelId}
+              onInspect={(nextPrompt) => {
+                setPrompt(nextPrompt)
+                setTab('lens')
+                void run(nextPrompt)
+              }}
+            />
+          )}
           {tab === 'lens' && <LogitLens result={lensResult} />}
           {tab === 'ablate' && (
             <AblationView modelId={modelId} prompt={prompt} analysis={result} />
