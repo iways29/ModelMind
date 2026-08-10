@@ -8,6 +8,7 @@ import { useEffect, useState } from 'react'
 
 import { analyze, API_BASE_URL, fetchModels, lens } from './api/client'
 import type { AnalyzeResponse, LensResponse, ModelInfo } from './api/types'
+import AblationView from './components/AblationView'
 import ActivationChart from './components/ActivationChart'
 import AttentionHeatmap from './components/AttentionHeatmap'
 import CompareView from './components/CompareView'
@@ -17,6 +18,7 @@ import { Button, ErrorNote, Note } from './components/ui'
 
 const TABS = [
   { id: 'lens', label: 'Watch it think' },
+  { id: 'ablate', label: 'Ablate' },
   { id: 'attention', label: 'Attention' },
   { id: 'activations', label: 'Activations' },
   { id: 'compare', label: 'Compare' },
@@ -171,6 +173,9 @@ export default function App() {
           </nav>
 
           {tab === 'lens' && <LogitLens result={lensResult} />}
+          {tab === 'ablate' && (
+            <AblationView modelId={modelId} prompt={prompt} analysis={result} />
+          )}
           {tab === 'attention' && <AttentionHeatmap result={result} />}
           {tab === 'activations' && <ActivationChart result={result} />}
           {tab === 'compare' && (

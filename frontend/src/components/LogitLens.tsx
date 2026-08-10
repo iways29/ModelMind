@@ -6,9 +6,10 @@
  * bottom. That orientation is a reading-order choice; the structure it shows is
  * the real one.
  *
- * Two encodings carry the meaning, and neither is decorative:
- *   - luminosity = how much probability that layer puts on the final answer
- *   - blur       = entropy. An undecided layer is literally out of focus.
+ * The node's luminosity is how much probability that layer puts on the final
+ * answer. Everything else is read off two labelled bars rather than encoded
+ * optically — an earlier version blurred undecided layers, which was legible as
+ * an effect and illegible as a number.
  */
 
 import { useEffect, useMemo, useState } from 'react'
@@ -55,7 +56,7 @@ export function LogitLens({ result }: { result: LensResponse | null }) {
   return (
     <Panel
       title="Watch it think"
-      subtitle="Every layer's residual stream, pushed through the model's own output head. Brightness is confidence in the final answer; blur is uncertainty."
+      subtitle="Every layer's residual stream, pushed through the model's own output head. Confidence is this layer's belief in the final answer; undecided is how spread out the rest of its guess is."
       controls={<Replay onClick={() => setRevealed(0)} />}
     >
       <div className="grid gap-8 lg:grid-cols-[minmax(0,1fr)_20rem]">
@@ -125,33 +126,62 @@ function Column({
   finalTokenId: number
 }) {
   // Entropy is unbounded in principle; scale against what this trace actually
-  // reached so the blur range is meaningful for this prompt.
+  // reached so the bar spans the range this prompt genuinely covers.
   const maxEntropy = useMemo(
     () => Math.max(1, ...layers.map((l) => l.entropy)),
     [layers],
   )
 
   return (
-    <div className="relative">
-      {/* The residual stream itself */}
-      <div className="absolute top-2 bottom-2 left-[76px] w-px bg-gradient-to-b from-transparent via-line-bright to-transparent" />
-      <div className="pointer-events-none absolute top-2 bottom-2 left-[76px] w-px overflow-hidden">
-        <div className="animate-descend h-8 w-px bg-gradient-to-b from-transparent via-base-accent to-transparent" />
-      </div>
+    <div>
+      {/* Outside the positioned wrapper below, so the spine still starts at the
+          first layer row rather than being pushed down past the labels. */}
+      <ColumnHeader />
 
-      <ol className="space-y-1">
-        {layers.map((layer, index) => (
-          <LayerRow
-            key={layer.layer}
-            layer={layer}
-            visible={index < revealed}
-            delay={index * 40}
-            maxEntropy={maxEntropy}
-            isFinal={index === layers.length - 1}
-            leaderIsAnswer={layer.top[0]?.token_id === finalTokenId}
-          />
-        ))}
-      </ol>
+      <div className="relative">
+        {/* The residual stream itself. Explicit stops rather than a
+            transparent->colour->transparent ramp: over a 13-row column that ramp
+            spends most of its length near-invisible, and the spine is structure,
+            not decoration. */}
+        <div className="absolute top-2 bottom-2 left-[76px] w-px bg-[linear-gradient(to_bottom,transparent,var(--color-line-bright)_10%,var(--color-line-bright)_90%,transparent)]" />
+        <div className="pointer-events-none absolute top-2 bottom-2 left-[76px] w-px overflow-hidden">
+          <div className="animate-descend h-8 w-px bg-gradient-to-b from-transparent via-base-accent to-transparent" />
+        </div>
+
+        <ol className="space-y-1">
+          {layers.map((layer, index) => (
+            <LayerRow
+              key={layer.layer}
+              layer={layer}
+              visible={index < revealed}
+              delay={index * 40}
+              maxEntropy={maxEntropy}
+              isFinal={index === layers.length - 1}
+              leaderIsAnswer={layer.top[0]?.token_id === finalTokenId}
+            />
+          ))}
+        </ol>
+      </div>
+    </div>
+  )
+}
+
+/**
+ * Two bars sit at the end of every row and mean opposite things, so they have
+ * to be named. Widths here must track the bar widths in `LayerRow`.
+ */
+function ColumnHeader() {
+  return (
+    <div className="mb-2 hidden items-center gap-4 px-2 font-mono text-[9px] tracking-[0.14em] text-ink-faint uppercase sm:flex">
+      <span className="w-[46px] shrink-0" />
+      <span className="w-8 shrink-0" />
+      <span className="min-w-0 flex-1">Best guess · also in play</span>
+      <span className="w-20 shrink-0 lg:w-24" title="Probability this layer already assigns to the model's final answer">
+        Confidence
+      </span>
+      <span className="w-20 shrink-0 lg:w-24" title="Shannon entropy: how spread out this layer's distribution still is">
+        Undecided
+      </span>
     </div>
   )
 }
@@ -174,10 +204,10 @@ function LayerRow({
   const leader = layer.top[0]
   if (!leader) return null
 
-  // Confidence in the eventual answer drives glow; entropy drives blur.
+  // Confidence in the eventual answer drives the node's size and glow; entropy
+  // is left entirely to its own bar, where it can be read as a number.
   const heat = Math.min(1, layer.target_prob)
-  const focus = 1 - Math.min(1, layer.entropy / maxEntropy)
-  const blur = (1 - focus) * 7
+  const spread = Math.min(1, layer.entropy / maxEntropy)
   const nodeSize = 9 + heat * 13
   const isEmbed = layer.layer === 0
 
@@ -205,7 +235,7 @@ function LayerRow({
               height: nodeSize + 14,
               background: PALETTE.base,
               opacity: 0.1 + heat * 0.4,
-              filter: `blur(${4 + blur}px)`,
+              filter: 'blur(6px)',
             }}
           />
           <span
@@ -215,7 +245,6 @@ function LayerRow({
               height: nodeSize,
               background: isEmbed ? PALETTE.inkFaint : PALETTE.base,
               opacity: isEmbed ? 0.45 : 0.35 + heat * 0.65,
-              filter: `blur(${blur * 0.5}px)`,
               boxShadow: heat > 0.3 ? `0 0 ${8 + heat * 22}px ${PALETTE.base}` : undefined,
             }}
           />
@@ -231,7 +260,6 @@ function LayerRow({
                   ? 'text-ink'
                   : 'text-ink-muted'
             }`}
-            style={{ filter: `blur(${blur * 0.18}px)` }}
           >
             {clean(leader.token)}
           </span>
@@ -243,28 +271,61 @@ function LayerRow({
               className="shrink-0 font-mono text-[9px] tracking-[0.12em] text-tuned-accent uppercase"
               title="The leading candidate changed at this layer"
             >
-              ↻ switched
+              ↻<span className="hidden lg:inline"> switched</span>
             </span>
           )}
-          <span className="hidden truncate font-mono text-[10px] text-ink-faint/70 md:inline">
+          {/* The runners-up are the point of the view as much as the leader is —
+              they're what the model considered and dropped. Truncating them is
+              fine; hiding them is not, so they stay from `sm` up and the two
+              meters give back the width instead. */}
+          <span className="hidden min-w-0 truncate font-mono text-[10px] text-ink-faint/70 sm:inline">
             {layer.top.slice(1, 4).map((t) => clean(t.token)).join(' · ')}
           </span>
         </span>
 
-        {/* Confidence in the final answer */}
-        <span className="hidden w-24 shrink-0 items-center gap-2 sm:flex">
-          <span className="h-1 flex-1 overflow-hidden rounded-full bg-line">
-            <span
-              className="block h-full rounded-full transition-[width] duration-500"
-              style={{ width: `${heat * 100}%`, background: PALETTE.base }}
-            />
-          </span>
-          <span className="tabular w-9 text-right font-mono text-[10px] text-ink-faint">
-            {(layer.target_prob * 100).toFixed(0)}%
-          </span>
-        </span>
+        <Meter
+          className="hidden sm:flex"
+          fraction={heat}
+          color={PALETTE.base}
+          value={`${(layer.target_prob * 100).toFixed(0)}%`}
+          title={`This layer puts ${(layer.target_prob * 100).toFixed(1)}% on the model's final answer`}
+        />
+        <Meter
+          className="hidden sm:flex"
+          fraction={spread}
+          color={PALETTE.tuned}
+          value={layer.entropy.toFixed(1)}
+          title={`${layer.entropy.toFixed(2)} bits of entropy — a full bar is the most undecided this run gets. Each bit removed halves the number of tokens genuinely in play.`}
+        />
       </div>
     </li>
+  )
+}
+
+/** One labelled bar + its number. Both row metrics render through this. */
+function Meter({
+  fraction,
+  color,
+  value,
+  title,
+  className = '',
+}: {
+  fraction: number
+  color: string
+  value: string
+  title: string
+  className?: string
+}) {
+  return (
+    <span className={`w-20 shrink-0 items-center gap-2 lg:w-24 ${className}`} title={title}>
+      <span className="h-1 flex-1 overflow-hidden rounded-full bg-line">
+        <span
+          className="block h-full rounded-full transition-[width] duration-500"
+          style={{ width: `${Math.max(0, Math.min(1, fraction)) * 100}%`, background: color }}
+        />
+      </span>
+      <span className="tabular w-9 text-right font-mono text-[10px] text-ink-faint">{value}</span>
+    </span>
   )
 }
 

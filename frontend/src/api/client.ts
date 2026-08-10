@@ -6,8 +6,12 @@
  */
 
 import type {
+  AblateRequest,
+  AblateResponse,
   AnalyzeRequest,
   AnalyzeResponse,
+  AttributionRequest,
+  AttributionResponse,
   CompareRequest,
   CompareResponse,
   LensRequest,
@@ -89,6 +93,16 @@ export function analyze(body: AnalyzeRequest): Promise<AnalyzeResponse> {
 /** POST /lens — the model's predicted next token decoded at every layer. */
 export function lens(body: LensRequest): Promise<LensResponse> {
   return post<LensResponse>('/lens', body)
+}
+
+/** POST /ablate — the same prompt with components switched off, diffed against intact. */
+export function ablate(body: AblateRequest): Promise<AblateResponse> {
+  return post<AblateResponse>('/ablate', body)
+}
+
+/** POST /attribution — ablate every block, or every head in one block, ranked by effect. */
+export function attribution(body: AttributionRequest): Promise<AttributionResponse> {
+  return post<AttributionResponse>('/attribution', body)
 }
 
 /** POST /compare — two models on one prompt, plus their per-layer delta. */

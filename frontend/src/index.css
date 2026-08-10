@@ -78,9 +78,10 @@ textarea {
 /* --------------------------------------------------------------------------
    Motion vocabulary for the lens view.
 
-   The encodings are semantic, not decorative: a layer's glow tracks how much
-   probability it puts on the final answer, and its blur tracks entropy — an
-   undecided layer is literally out of focus, a committed one is a tight point.
+   A layer's glow tracks how much probability it puts on the final answer. The
+   blur in `settle` below is purely a reveal transition and carries no meaning —
+   entropy used to be encoded as blur and is now a labelled bar, because an
+   optical effect reads as a rendering artifact rather than a measurement.
    -------------------------------------------------------------------------- */
 
 @keyframes breathe {

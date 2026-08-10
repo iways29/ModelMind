@@ -97,6 +97,114 @@ export interface LensResponse {
   prompt_notice: string | null
 }
 
+/**
+ * Mirrors `Ablation`.
+ *
+ * `layer` is the 0-based block index the backend actually hooks. Display labels
+ * shift by one so a block is named after the residual row it writes — block 4
+ * shows as "L5", matching the lens. Never render `layer` raw; use the `label`
+ * the backend sends back.
+ */
+export interface Ablation {
+  layer: number
+  /** Omit or null to ablate the whole block. */
+  head?: number | null
+}
+
+/** Mirrors `LensTrace` — the layer readout of one forward pass. */
+export interface LensTrace {
+  layers: LayerLens[]
+  trajectories: TokenTrajectory[]
+  final_prediction: TokenPrediction
+}
+
+/** Mirrors `TokenShift`. */
+export interface TokenShift {
+  token: string
+  token_id: number
+  baseline_prob: number
+  ablated_prob: number
+  /** ablated_prob - baseline_prob. Negative means the ablation suppressed it. */
+  delta: number
+}
+
+/** Mirrors `AblationEffect`. */
+export interface AblationEffect {
+  answer_changed: boolean
+  baseline_answer: TokenPrediction
+  ablated_answer: TokenPrediction
+  baseline_answer_prob_after: number
+  prob_delta: number
+  /** KL(baseline || ablated) in bits — 0 means the component changed nothing. */
+  kl_bits: number
+  top_shifts: TokenShift[]
+}
+
+/** Mirrors `AblateRequest`. */
+export interface AblateRequest {
+  model_id: string
+  prompt: string
+  ablations: Ablation[]
+  top_k?: number
+  position?: number
+  max_tokens?: number
+}
+
+/** Mirrors `AblateResponse`. */
+export interface AblateResponse {
+  model_id: string
+  display_name: string
+  tokens: string[]
+  position: number
+  ablations: Ablation[]
+  ablation_label: string
+  baseline: LensTrace
+  ablated: LensTrace
+  effect: AblationEffect
+  narration: string[]
+  truncated: boolean
+  prompt_notice: string | null
+}
+
+/** Mirrors `ComponentEffect` — one component's measured contribution. */
+export interface ComponentEffect {
+  layer: number
+  head: number | null
+  label: string
+  baseline_answer_prob_after: number
+  prob_delta: number
+  kl_bits: number
+  top_token: string
+  top_token_id: number
+  answer_changed: boolean
+}
+
+/** Mirrors `AttributionRequest`. `layer` is required when scope is 'heads'. */
+export interface AttributionRequest {
+  model_id: string
+  prompt: string
+  scope: 'layers' | 'heads'
+  layer?: number
+  position?: number
+  max_tokens?: number
+}
+
+/** Mirrors `AttributionResponse`. `components` arrives ranked by kl_bits. */
+export interface AttributionResponse {
+  model_id: string
+  display_name: string
+  tokens: string[]
+  position: number
+  scope: 'layers' | 'heads'
+  layer: number | null
+  baseline_answer: TokenPrediction
+  components: ComponentEffect[]
+  runs: number
+  narration: string[]
+  truncated: boolean
+  prompt_notice: string | null
+}
+
 /** Mirrors `CompareRequest`. */
 export interface CompareRequest {
   base_model_id: string

@@ -13,8 +13,12 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from . import inference, models
 from .schemas import (
+    AblateRequest,
+    AblateResponse,
     AnalyzeRequest,
     AnalyzeResponse,
+    AttributionRequest,
+    AttributionResponse,
     CompareRequest,
     CompareResponse,
     LensRequest,
@@ -87,6 +91,50 @@ def post_lens(request: LensRequest) -> LensResponse:
     except inference.EmptyPromptError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except inference.LensUnsupportedError as exc:
+        raise HTTPException(status_code=501, detail=str(exc)) from exc
+    except inference.ModelLoadError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@app.post("/ablate", response_model=AblateResponse)
+def post_ablate(request: AblateRequest) -> AblateResponse:
+    """Switch components off, re-run, and diff against the intact model."""
+    try:
+        return inference.ablate(
+            request.model_id,
+            request.prompt,
+            request.ablations,
+            top_k=request.top_k,
+            position=request.position,
+            max_tokens=request.max_tokens,
+        )
+    except models.UnknownModelError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (inference.EmptyPromptError, inference.InvalidAblationError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except (inference.LensUnsupportedError, inference.AblationUnsupportedError) as exc:
+        raise HTTPException(status_code=501, detail=str(exc)) from exc
+    except inference.ModelLoadError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@app.post("/attribution", response_model=AttributionResponse)
+def post_attribution(request: AttributionRequest) -> AttributionResponse:
+    """Ablate every block, or every head in one block, and rank them by effect."""
+    try:
+        return inference.attribution(
+            request.model_id,
+            request.prompt,
+            scope=request.scope,
+            layer=request.layer,
+            position=request.position,
+            max_tokens=request.max_tokens,
+        )
+    except models.UnknownModelError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (inference.EmptyPromptError, inference.InvalidAblationError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except inference.AblationUnsupportedError as exc:
         raise HTTPException(status_code=501, detail=str(exc)) from exc
     except inference.ModelLoadError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc

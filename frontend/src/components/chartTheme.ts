@@ -19,6 +19,7 @@ export const PALETTE = {
   base: '#38bdf8',
   tuned: '#fbbf24',
   delta: '#a78bfa',
+  danger: '#fb7185',
 } as const
 
 const MONO = "'SF Mono', 'JetBrains Mono', ui-monospace, Menlo, monospace"

@@ -8,21 +8,29 @@ import logging
 import os
 import threading
 import unicodedata
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
 
-from .insights import narrate_lens
+from .insights import narrate_ablation, narrate_attribution, narrate_lens
 from .models import ModelInfo, get_model
 from .schemas import (
+    Ablation,
+    AblateResponse,
+    AblationEffect,
     AnalyzeResponse,
+    AttributionResponse,
     CompareResponse,
+    ComponentEffect,
     LayerLens,
     LensResponse,
+    LensTrace,
     ModelMagnitudes,
     TokenPrediction,
+    TokenShift,
     TokenTrajectory,
 )
 
@@ -56,6 +64,14 @@ class EmptyPromptError(ValueError):
 
 class LensUnsupportedError(RuntimeError):
     """Raised when a model doesn't expose the final norm + output head the lens needs."""
+
+
+class AblationUnsupportedError(RuntimeError):
+    """Raised when a model's block/attention layout isn't one we know how to switch off."""
+
+
+class InvalidAblationError(ValueError):
+    """Raised when an ablation names a layer or head this model doesn't have."""
 
 
 @dataclass(frozen=True)
@@ -193,10 +209,18 @@ def _clean_prompt(prompt: str) -> Tuple[str, Optional[str]]:
     )
 
 
-def _forward(
-    loaded: LoadedModel, prompt: str, max_tokens: Optional[int]
-) -> Tuple[List[str], Any, bool, Optional[str]]:
-    """Run one CPU forward pass and return (display tokens, output, truncated, notice)."""
+@dataclass(frozen=True)
+class _Prepared:
+    """A tokenized prompt, ready to be run through the model any number of times."""
+
+    input_ids: torch.Tensor
+    tokens: List[str]
+    truncated: bool
+    notice: Optional[str]
+
+
+def _prepare(loaded: LoadedModel, prompt: str, max_tokens: Optional[int]) -> _Prepared:
+    """Tokenize once. Ablation sweeps re-run the model dozens of times on this."""
     budget = _resolve_token_budget(max_tokens)
 
     prompt, notice = _clean_prompt(prompt)
@@ -207,19 +231,152 @@ def _forward(
         raise EmptyPromptError("Prompt tokenized to zero tokens.")
 
     truncated = len(full_ids) > budget
-    input_ids = torch.tensor([full_ids[:budget]], dtype=torch.long, device=DEVICE)
-    attention_mask = torch.ones_like(input_ids)
+    ids = full_ids[:budget]
+    return _Prepared(
+        input_ids=torch.tensor([ids], dtype=torch.long, device=DEVICE),
+        tokens=[_display_token(loaded.tokenizer, t) for t in ids],
+        truncated=truncated,
+        notice=notice,
+    )
 
-    with torch.no_grad():
-        outputs = loaded.model(
+
+def _run(
+    loaded: LoadedModel,
+    input_ids: torch.Tensor,
+    ablations: Sequence[Ablation] = (),
+    internals: bool = True,
+) -> Any:
+    """One CPU forward pass, optionally with components switched off.
+
+    `internals=False` skips attention and hidden-state collection, which is most
+    of the cost when all a caller wants is the final logits — the sweep case.
+    """
+    with torch.no_grad(), _ablated(loaded, ablations):
+        return loaded.model(
             input_ids=input_ids,
-            attention_mask=attention_mask,
-            output_attentions=True,
-            output_hidden_states=True,
+            attention_mask=torch.ones_like(input_ids),
+            output_attentions=internals,
+            output_hidden_states=internals,
+            use_cache=False,
         )
 
-    ids = input_ids[0].tolist()
-    return [_display_token(loaded.tokenizer, t) for t in ids], outputs, truncated, notice
+
+def _forward(
+    loaded: LoadedModel, prompt: str, max_tokens: Optional[int]
+) -> Tuple[List[str], Any, bool, Optional[str]]:
+    """Run one CPU forward pass and return (display tokens, output, truncated, notice)."""
+    prepared = _prepare(loaded, prompt, max_tokens)
+    outputs = _run(loaded, prepared.input_ids)
+    return prepared.tokens, outputs, prepared.truncated, prepared.notice
+
+
+# --------------------------------------------------------------------------
+# Ablation hooks
+#
+# Two different surgeries, because "switch this off" means two different things
+# at the two granularities:
+#
+#   whole block — replace the block's output with its own input, so the residual
+#                 stream flows past untouched. Attention and MLP both contribute
+#                 nothing; the model runs as if the layer were not there.
+#   single head — zero that head's slice of the concatenated attention output
+#                 *before* the output projection mixes the heads together. After
+#                 c_proj the heads are summed and can no longer be separated.
+# --------------------------------------------------------------------------
+
+
+def _blocks(model: PreTrainedModel) -> Any:
+    """The indexable list of transformer blocks."""
+    base = getattr(model, "transformer", None) or getattr(model, "model", None)
+    blocks = getattr(base, "h", None) if base is not None else None
+    if blocks is None and base is not None:
+        blocks = getattr(base, "layers", None)
+    if blocks is None:
+        raise AblationUnsupportedError(
+            f"{model.__class__.__name__} does not expose an indexable list of transformer "
+            "blocks, so its components can't be switched off."
+        )
+    return blocks
+
+
+def _skip_block_hook(module: Any, args: Any, kwargs: Any, output: Any) -> Any:
+    """Return the block's input in place of its output."""
+    resid = args[0] if args else kwargs.get("hidden_states")
+    if resid is None:
+        return output
+    # GPT2Block returns (hidden_states,) plus attention weights when they were
+    # requested. Keep the tail so `output_attentions=True` still works.
+    if isinstance(output, tuple):
+        return (resid,) + tuple(output[1:])
+    return resid
+
+
+def _zero_head_hook(head: int, head_dim: int) -> Any:
+    """Pre-hook for `attn.c_proj` that blanks one head's contribution."""
+
+    def hook(module: Any, args: Any) -> Any:
+        merged = args[0]
+        # Clone: the incoming tensor is the attention output, and writing into it
+        # in place would corrupt autograd bookkeeping and any shared storage.
+        patched = merged.clone()
+        patched[..., head * head_dim : (head + 1) * head_dim] = 0.0
+        return (patched,) + tuple(args[1:])
+
+    return hook
+
+
+def _validate_ablations(loaded: LoadedModel, ablations: Iterable[Ablation]) -> List[Ablation]:
+    resolved = list(ablations)
+    for ablation in resolved:
+        if ablation.layer >= loaded.num_layers:
+            raise InvalidAblationError(
+                f"{loaded.info.display_name} has {loaded.num_layers} blocks (0-"
+                f"{loaded.num_layers - 1}); layer {ablation.layer} doesn't exist."
+            )
+        if ablation.head is not None and ablation.head >= loaded.num_heads:
+            raise InvalidAblationError(
+                f"{loaded.info.display_name} has {loaded.num_heads} heads per block (0-"
+                f"{loaded.num_heads - 1}); head {ablation.head} doesn't exist."
+            )
+    return resolved
+
+
+@contextmanager
+def _ablated(loaded: LoadedModel, ablations: Sequence[Ablation]) -> Iterator[None]:
+    """Install ablation hooks for the duration of the block, then always remove them.
+
+    The model is a process-wide cached singleton, so a hook that outlives its
+    request would silently corrupt every later run. Hence the unconditional
+    teardown in `finally`.
+    """
+    if not ablations:
+        yield
+        return
+
+    blocks = _blocks(loaded.model)
+    head_dim = int(loaded.model.config.hidden_size) // loaded.num_heads
+    handles: List[Any] = []
+    try:
+        for ablation in ablations:
+            block = blocks[ablation.layer]
+            if ablation.head is None:
+                handles.append(block.register_forward_hook(_skip_block_hook, with_kwargs=True))
+                continue
+
+            attn = getattr(block, "attn", None) or getattr(block, "self_attn", None)
+            projection = getattr(attn, "c_proj", None) or getattr(attn, "o_proj", None)
+            if projection is None:
+                raise AblationUnsupportedError(
+                    f"Block {ablation.layer} has no attention output projection to hook, "
+                    "so individual heads can't be isolated."
+                )
+            handles.append(
+                projection.register_forward_pre_hook(_zero_head_hook(ablation.head, head_dim))
+            )
+        yield
+    finally:
+        for handle in handles:
+            handle.remove()
 
 
 def _attentions_to_nested(outputs: Any) -> List[List[List[List[float]]]]:
@@ -350,27 +507,22 @@ def _entropy_bits(probs: torch.Tensor) -> float:
     return float(-(safe * safe.log2()).sum().item())
 
 
-def logit_lens(
-    model_id: str,
-    prompt: str,
-    top_k: int = 5,
-    position: Optional[int] = None,
-    max_tokens: Optional[int] = None,
-) -> LensResponse:
-    """Decode what the model 'believes' the next token is, at every layer.
+def _resolve_position(tokens: Sequence[str], position: Optional[int]) -> int:
+    return len(tokens) - 1 if position is None else max(0, min(int(position), len(tokens) - 1))
 
-    At each hidden state we run the residual stream through the final layer norm
-    and the unembedding matrix — the same path the last layer takes — and read
-    off a probability distribution over the vocabulary. Watching the top-1
-    change from layer to layer is the model forming its answer.
+
+def _lens_trace(
+    loaded: LoadedModel, outputs: Any, pos: int, top_k: int
+) -> Tuple[LensTrace, torch.Tensor]:
+    """Decode every layer's residual stream into a next-token distribution.
+
+    Returns the trace plus the final-layer probability vector, which callers
+    comparing two runs need at full vocabulary width.
     """
-    loaded = load_model(model_id)
-    tokens, outputs, truncated, notice = _forward(loaded, prompt, max_tokens)
     norm, head = _output_projection(loaded.model)
 
     hidden = outputs.hidden_states
     last_index = len(hidden) - 1
-    pos = len(tokens) - 1 if position is None else max(0, min(int(position), len(tokens) - 1))
 
     def distribution(layer_index: int) -> torch.Tensor:
         resid = hidden[layer_index][0, pos]
@@ -385,7 +537,7 @@ def logit_lens(
     # re-running the projection per token of interest.
     per_layer = [distribution(i) for i in range(len(hidden))]
 
-    # The final layer's argmax is the model's actual answer; every earlier layer
+    # The final layer's argmax is this run's actual answer; every earlier layer
     # is scored against it so we can watch that answer's probability grow.
     final_probs = per_layer[last_index]
     final_id = int(torch.argmax(final_probs).item())
@@ -440,21 +592,247 @@ def logit_lens(
     # Strongest first, so the frontend can draw the top N and drop the tail.
     trajectories.sort(key=lambda t: t.peak_prob, reverse=True)
 
-    final_prediction = TokenPrediction(
-        token=_display_token(loaded.tokenizer, final_id),
-        token_id=final_id,
-        prob=round(float(final_probs[final_id].item()), 6),
+    trace = LensTrace(
+        layers=layers,
+        trajectories=trajectories,
+        final_prediction=TokenPrediction(
+            token=_display_token(loaded.tokenizer, final_id),
+            token_id=final_id,
+            prob=round(float(final_probs[final_id].item()), 6),
+        ),
     )
+    return trace, final_probs
+
+
+def logit_lens(
+    model_id: str,
+    prompt: str,
+    top_k: int = 5,
+    position: Optional[int] = None,
+    max_tokens: Optional[int] = None,
+) -> LensResponse:
+    """Decode what the model 'believes' the next token is, at every layer.
+
+    At each hidden state we run the residual stream through the final layer norm
+    and the unembedding matrix — the same path the last layer takes — and read
+    off a probability distribution over the vocabulary. Watching the top-1
+    change from layer to layer is the model forming its answer.
+    """
+    loaded = load_model(model_id)
+    prepared = _prepare(loaded, prompt, max_tokens)
+    pos = _resolve_position(prepared.tokens, position)
+    outputs = _run(loaded, prepared.input_ids)
+    trace, _ = _lens_trace(loaded, outputs, pos, top_k)
 
     return LensResponse(
         model_id=loaded.info.id,
         display_name=loaded.info.display_name,
-        tokens=tokens,
+        tokens=prepared.tokens,
         position=pos,
-        layers=layers,
-        trajectories=trajectories,
-        final_prediction=final_prediction,
-        narration=narrate_lens(layers, trajectories, final_prediction, tokens[pos]),
-        truncated=truncated,
-        prompt_notice=notice,
+        layers=trace.layers,
+        trajectories=trace.trajectories,
+        final_prediction=trace.final_prediction,
+        narration=narrate_lens(
+            trace.layers, trace.trajectories, trace.final_prediction, prepared.tokens[pos]
+        ),
+        truncated=prepared.truncated,
+        prompt_notice=prepared.notice,
+    )
+
+
+# --------------------------------------------------------------------------
+# Ablation
+# --------------------------------------------------------------------------
+
+
+def _kl_bits(reference: torch.Tensor, other: torch.Tensor) -> float:
+    """KL(reference || other) in bits — how much the ablated run surprises the baseline.
+
+    Asymmetric on purpose: it weights the tokens the *intact* model cared about,
+    which is the question being asked ("what did removing this cost the answer?").
+    """
+    p = reference.clamp_min(1e-12)
+    q = other.clamp_min(1e-12)
+    return float((p * (p.log2() - q.log2())).sum().item())
+
+
+def _top_shifts(
+    loaded: LoadedModel, baseline: torch.Tensor, ablated: torch.Tensor, limit: int = 6
+) -> List[TokenShift]:
+    """The candidates whose probability moved most, in either direction."""
+    delta = ablated - baseline
+    moved = torch.topk(delta.abs(), limit).indices
+
+    shifts = [
+        TokenShift(
+            token=_display_token(loaded.tokenizer, int(tid)),
+            token_id=int(tid),
+            baseline_prob=round(float(baseline[tid].item()), 6),
+            ablated_prob=round(float(ablated[tid].item()), 6),
+            delta=round(float(delta[tid].item()), 6),
+        )
+        for tid in moved
+    ]
+    shifts.sort(key=lambda s: abs(s.delta), reverse=True)
+    return shifts
+
+
+def _block_label(layer: int) -> str:
+    """Name a block the way the lens names its output.
+
+    The lens labels hidden states, where "L5" is the residual stream *after*
+    block 4. Numbering blocks 0-based in the UI too would mean ablating "L4" and
+    watching the trace change at "L5", which reads as an off-by-one bug. So the
+    wire keeps the honest 0-based block index and the label is shifted to match
+    the row the block writes.
+    """
+    return f"L{layer + 1}"
+
+
+def _ablation_label(ablations: Sequence[Ablation]) -> str:
+    parts = [
+        _block_label(a.layer) if a.head is None else f"{_block_label(a.layer)} H{a.head}"
+        for a in ablations
+    ]
+    return " + ".join(parts)
+
+
+def _final_probs(outputs: Any, pos: int) -> torch.Tensor:
+    """Softmax over the model's own output logits at one position."""
+    return torch.softmax(outputs.logits[0, pos].float(), dim=-1)
+
+
+def ablate(
+    model_id: str,
+    prompt: str,
+    ablations: Sequence[Ablation],
+    top_k: int = 5,
+    position: Optional[int] = None,
+    max_tokens: Optional[int] = None,
+) -> AblateResponse:
+    """Run the model twice — intact, then with components switched off — and diff.
+
+    This is the counterfactual the rest of the tool can only hint at: the lens
+    shows *when* an answer formed, and this shows *what the answer depended on*.
+    """
+    loaded = load_model(model_id)
+    resolved = _validate_ablations(loaded, ablations)
+
+    prepared = _prepare(loaded, prompt, max_tokens)
+    pos = _resolve_position(prepared.tokens, position)
+
+    baseline_trace, baseline_probs = _lens_trace(
+        loaded, _run(loaded, prepared.input_ids), pos, top_k
+    )
+    ablated_trace, ablated_probs = _lens_trace(
+        loaded, _run(loaded, prepared.input_ids, resolved), pos, top_k
+    )
+
+    baseline_answer = baseline_trace.final_prediction
+    after = float(ablated_probs[baseline_answer.token_id].item())
+
+    effect = AblationEffect(
+        answer_changed=ablated_trace.final_prediction.token_id != baseline_answer.token_id,
+        baseline_answer=baseline_answer,
+        ablated_answer=ablated_trace.final_prediction,
+        baseline_answer_prob_after=round(after, 6),
+        prob_delta=round(after - baseline_answer.prob, 6),
+        kl_bits=round(_kl_bits(baseline_probs, ablated_probs), 4),
+        top_shifts=_top_shifts(loaded, baseline_probs, ablated_probs),
+    )
+
+    label = _ablation_label(resolved)
+    return AblateResponse(
+        model_id=loaded.info.id,
+        display_name=loaded.info.display_name,
+        tokens=prepared.tokens,
+        position=pos,
+        ablations=resolved,
+        ablation_label=label,
+        baseline=baseline_trace,
+        ablated=ablated_trace,
+        effect=effect,
+        narration=narrate_ablation(label, effect, baseline_trace, ablated_trace),
+        truncated=prepared.truncated,
+        prompt_notice=prepared.notice,
+    )
+
+
+def attribution(
+    model_id: str,
+    prompt: str,
+    scope: str = "heads",
+    layer: Optional[int] = None,
+    position: Optional[int] = None,
+    max_tokens: Optional[int] = None,
+) -> AttributionResponse:
+    """Ablate every component of one kind in turn and rank them by effect.
+
+    One ablation at a time answers "did this matter?"; only a sweep answers
+    "which one mattered most?", and a 12-head block is far too many to try by
+    hand. Each run needs only the final logits, so `internals=False` keeps the
+    sweep to roughly one baseline forward pass per component.
+    """
+    loaded = load_model(model_id)
+
+    if scope == "heads":
+        if layer is None:
+            raise InvalidAblationError("scope='heads' needs a layer to sweep.")
+        targets = [Ablation(layer=layer, head=h) for h in range(loaded.num_heads)]
+    else:
+        targets = [Ablation(layer=index) for index in range(loaded.num_layers)]
+    _validate_ablations(loaded, targets)
+
+    prepared = _prepare(loaded, prompt, max_tokens)
+    pos = _resolve_position(prepared.tokens, position)
+
+    baseline_probs = _final_probs(_run(loaded, prepared.input_ids, internals=False), pos)
+    baseline_id = int(torch.argmax(baseline_probs).item())
+    baseline_answer = TokenPrediction(
+        token=_display_token(loaded.tokenizer, baseline_id),
+        token_id=baseline_id,
+        prob=round(float(baseline_probs[baseline_id].item()), 6),
+    )
+
+    components: List[ComponentEffect] = []
+    for target in targets:
+        probs = _final_probs(
+            _run(loaded, prepared.input_ids, [target], internals=False), pos
+        )
+        top_id = int(torch.argmax(probs).item())
+        after = float(probs[baseline_id].item())
+        components.append(
+            ComponentEffect(
+                layer=target.layer,
+                head=target.head,
+                label=_ablation_label([target]),
+                baseline_answer_prob_after=round(after, 6),
+                prob_delta=round(after - baseline_answer.prob, 6),
+                kl_bits=round(_kl_bits(baseline_probs, probs), 4),
+                top_token=_display_token(loaded.tokenizer, top_id),
+                top_token_id=top_id,
+                answer_changed=top_id != baseline_id,
+            )
+        )
+
+    components.sort(key=lambda c: c.kl_bits, reverse=True)
+
+    return AttributionResponse(
+        model_id=loaded.info.id,
+        display_name=loaded.info.display_name,
+        tokens=prepared.tokens,
+        position=pos,
+        scope=scope,
+        layer=layer if scope == "heads" else None,
+        baseline_answer=baseline_answer,
+        components=components,
+        runs=len(targets),
+        narration=narrate_attribution(
+            scope,
+            components,
+            baseline_answer,
+            _block_label(layer) if scope == "heads" and layer is not None else None,
+        ),
+        truncated=prepared.truncated,
+        prompt_notice=prepared.notice,
     )

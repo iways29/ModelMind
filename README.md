@@ -2,7 +2,8 @@
 
 A local tool for watching GPT-2 family checkpoints think. Type a prompt and see
 the model's answer *form* — layer by layer, with the candidates it considered
-and discarded on the way — plus attention weights for any layer/head pair,
+and discarded on the way — then switch any block or attention head off and watch
+what the answer depended on. Plus attention weights for any layer/head pair,
 activation magnitude through the residual stream, and a diff of a fine-tune
 against its base.
 
@@ -67,10 +68,10 @@ form: GPT-2 on *"The movie was absolutely"* cycles through `clear` → `quite` �
 locks onto `amazing` at L5 → peaks at **80% by L9** → then decays to 10% as it
 hedges across `fantastic`/`brilliant`/`phenomenal`.
 
-Two visual encodings carry the meaning and neither is decorative: **brightness**
-is how much probability that layer puts on the final answer, and **blur** is
-entropy — an undecided layer is literally out of focus. Plain-English findings
-are generated alongside, so you don't have to read the numbers to get the story.
+Each row ends in two labelled bars: **confidence** is how much probability that
+layer puts on the final answer, **undecided** is entropy in bits. Plain-English
+findings are generated alongside, so you don't have to read the numbers to get
+the story.
 
 The technique is the *logit lens* (nostalgebraist, 2020). Two honest caveats it
 surfaces for you: the `embed` row is an artifact — GPT-2 ties its input and
@@ -81,6 +82,34 @@ output embedding.
 Try `The capital of France is`: GPT-2 puts 62% on `France` and 18% on `Paris` at
 layer 10, then throws it away by layer 12 to predict `the`. The knowledge is in
 there; the last block spends it on grammar.
+
+**Ablate** — the counterfactual. Switch a component off, re-run the same prompt,
+and diff against the intact model. A whole block is skipped so the residual
+stream passes through untouched; a single head has its slice of the attention
+output zeroed before `c_proj` mixes the heads together, which is the last moment
+the heads are still separable.
+
+This is the only view that answers *what the answer depended on* rather than
+*when it formed*. On `The capital of France is`, ablating **L12** — the block
+that spends the answer on grammar — flips the prediction back from `the` (8%) to
+`France` (24%), and the layer trace shows the two runs identical until exactly
+that block. Ablating **L5** yields `Paris`.
+
+Effect size is KL(intact ‖ ablated) over the full vocabulary, in bits. Zero means
+the component made no difference to this prompt.
+
+**Rank by contribution** sits under the same tab: it ablates each component in
+turn and ranks them. `All blocks` is one run per block, `Heads in L…` is one run
+per head in the selected block — a dozen CPU forward passes, under a second.
+Single ablation answers "did this matter?"; only the sweep answers "which one
+mattered?", which is not a question you can brute-force by hand across 144 heads.
+Bars are square-rooted because block 0 scores an order of magnitude above
+everything else; the exact figure is printed next to each one.
+
+Two honest limits it states rather than hides: an effect is measured *on this
+prompt*, so the ranking moves when the prompt does; and a component can look
+inert because another one compensates, which single-component ablation cannot
+see.
 
 **Attention** — a token × token heatmap for one (layer, head) pair, with real
 token labels on both axes. Rows are query tokens, columns are keys. The upper
@@ -118,9 +147,18 @@ covers the shared prefix and the response carries a note saying so.
 | `GET` | `/models` | — | `ModelInfo[]` |
 | `POST` | `/analyze` | `{model_id, prompt}` | `{tokens, attentions, hidden_state_magnitudes, …}` |
 | `POST` | `/lens` | `{model_id, prompt, top_k?}` | per-layer top-k predictions, gap-free `trajectories`, and `narration` |
+| `POST` | `/ablate` | `{model_id, prompt, ablations[]}` | `baseline` and `ablated` traces + an `effect` block |
+| `POST` | `/attribution` | `{model_id, prompt, scope, layer?}` | `components` ranked by `kl_bits` |
 | `POST` | `/compare` | `{base_model_id, finetuned_model_id, prompt}` | both profiles + per-layer `delta` |
 
 `attentions` is nested layer → head → seq × seq.
+
+An ablation is `{layer, head?}`; omit `head` to skip the whole block. `layer` is
+the honest 0-based block index, while every display label is shifted by one so a
+block is named after the residual row it writes — block 11 reads as `L12`, the
+same row the lens shows it landing in. Numbering both 0-based made every ablation
+look off by one. `scope` is `"layers"` (one run per block) or `"heads"` (one run
+per head, needs `layer`).
 
 ## How the code is organised
 
@@ -137,6 +175,10 @@ Analysis that produces *prose* rather than numbers lives in
 `backend/app/insights.py`, which is deliberately torch-free — it takes a
 finished layer trace and returns sentences, so it can be reasoned about and
 changed without touching inference.
+
+Ablation hooks are installed by a context manager (`_ablated`) and torn down in
+a `finally`. The model is a process-wide cached singleton, so a hook that
+outlived its request would silently corrupt every later run.
 
 Response shapes are defined once in `backend/app/schemas.py` and mirrored by
 hand in `frontend/src/api/types.ts`. No codegen at this stage — change both in

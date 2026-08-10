@@ -189,3 +189,167 @@ class LensResponse(Schema):
         None,
         description="Set when the server had to adjust the prompt, e.g. trimming whitespace.",
     )
+
+
+# --------------------------------------------------------------------------
+# Ablation — "what does the model predict if this component never fired?"
+# --------------------------------------------------------------------------
+
+
+class Ablation(Schema):
+    """One component to switch off for the duration of a forward pass.
+
+    `layer` is the honest 0-based block index. Display labels shift by one so a
+    block is named after the residual-stream row it writes — block 4 is "L5",
+    the same row the lens shows it landing in.
+    """
+
+    layer: int = Field(..., ge=0, description="Transformer block index, 0-based.")
+    head: Optional[int] = Field(
+        None,
+        ge=0,
+        description=(
+            "Attention head within that block. Omit to ablate the whole block, which "
+            "passes the residual stream through untouched as if the layer weren't there."
+        ),
+    )
+
+
+class LensTrace(Schema):
+    """The layer-by-layer readout of a single forward pass.
+
+    Shared shape so a baseline run and an ablated run can be drawn by the same
+    component with no branching.
+    """
+
+    layers: List[LayerLens]
+    trajectories: List[TokenTrajectory]
+    final_prediction: TokenPrediction
+
+
+class TokenShift(Schema):
+    """How one candidate's final-layer probability moved under ablation."""
+
+    token: str
+    token_id: int
+    baseline_prob: float
+    ablated_prob: float
+    delta: float = Field(..., description="ablated_prob - baseline_prob. Negative means suppressed.")
+
+
+class AblationEffect(Schema):
+    """Scalar summary of what switching a component off did to the answer."""
+
+    answer_changed: bool = Field(
+        ..., description="True if the ablated run's top-1 differs from the baseline's."
+    )
+    baseline_answer: TokenPrediction
+    ablated_answer: TokenPrediction = Field(
+        ..., description="The ablated run's own top-1, which may be a different token."
+    )
+    baseline_answer_prob_after: float = Field(
+        ...,
+        description="Probability the ablated run still assigns to the BASELINE answer token.",
+    )
+    prob_delta: float = Field(
+        ...,
+        description=(
+            "baseline_answer_prob_after - baseline_answer.prob. The signed change in "
+            "support for the answer the intact model gave."
+        ),
+    )
+    kl_bits: float = Field(
+        ...,
+        description=(
+            "KL(baseline || ablated) over the full vocabulary, in bits. The scalar "
+            "effect size — 0 means the component made no difference to this prompt."
+        ),
+    )
+    top_shifts: List[TokenShift] = Field(
+        ..., description="Candidates whose probability moved most, largest magnitude first."
+    )
+
+
+class AblateRequest(Schema):
+    model_id: str
+    prompt: str = Field(..., min_length=1, max_length=2000)
+    ablations: List[Ablation] = Field(
+        ...,
+        min_length=1,
+        max_length=16,
+        description="Components to switch off. All are applied to the same forward pass.",
+    )
+    top_k: int = Field(5, ge=1, le=10)
+    position: Optional[int] = None
+    max_tokens: Optional[int] = Field(None, ge=1)
+
+
+class AblateResponse(Schema):
+    model_id: str
+    display_name: str
+    tokens: List[str]
+    position: int
+    ablations: List[Ablation] = Field(..., description="Echoed back, resolved and validated.")
+    ablation_label: str = Field(..., description="Human-readable summary, e.g. 'L7 H3'.")
+    baseline: LensTrace
+    ablated: LensTrace
+    effect: AblationEffect
+    narration: List[str]
+    truncated: bool
+    prompt_notice: Optional[str] = None
+
+
+# --------------------------------------------------------------------------
+# Attribution sweep — ablate every component of one kind, then rank them
+# --------------------------------------------------------------------------
+
+
+class ComponentEffect(Schema):
+    """One component's measured contribution, from its own ablation run."""
+
+    layer: int = Field(..., description="0-based block index; `label` carries the display name.")
+    head: Optional[int] = Field(None, description="None when the whole block was ablated.")
+    label: str = Field(..., description="'L8' for block 7, 'L8 H3' for head 3 inside it.")
+    baseline_answer_prob_after: float
+    prob_delta: float
+    kl_bits: float
+    top_token: str = Field(..., description="What the ablated run predicts instead.")
+    top_token_id: int
+    answer_changed: bool
+
+
+class AttributionRequest(Schema):
+    model_id: str
+    prompt: str = Field(..., min_length=1, max_length=2000)
+    scope: str = Field(
+        "heads",
+        description=(
+            "'layers' ablates each block in turn (one run per block). 'heads' ablates "
+            "each head inside `layer` (one run per head)."
+        ),
+        pattern="^(layers|heads)$",
+    )
+    layer: Optional[int] = Field(
+        None,
+        ge=0,
+        description="Required when scope is 'heads'; ignored when scope is 'layers'.",
+    )
+    position: Optional[int] = None
+    max_tokens: Optional[int] = Field(None, ge=1)
+
+
+class AttributionResponse(Schema):
+    model_id: str
+    display_name: str
+    tokens: List[str]
+    position: int
+    scope: str
+    layer: Optional[int] = None
+    baseline_answer: TokenPrediction
+    components: List[ComponentEffect] = Field(
+        ..., description="Ranked by kl_bits, strongest effect first."
+    )
+    runs: int = Field(..., description="Forward passes performed, excluding the baseline.")
+    narration: List[str]
+    truncated: bool
+    prompt_notice: Optional[str] = None

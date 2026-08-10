@@ -8,9 +8,16 @@ Deliberately conservative: every claim here is a direct restatement of a number
 in the trace, never an inference about *why* the model did something.
 """
 
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
-from .schemas import LayerLens, TokenPrediction, TokenTrajectory
+from .schemas import (
+    AblationEffect,
+    ComponentEffect,
+    LayerLens,
+    LensTrace,
+    TokenPrediction,
+    TokenTrajectory,
+)
 
 # Below this probability, a layer's "guess" is barely better than noise and
 # calling it the model's belief would overstate things.
@@ -181,6 +188,173 @@ def _lock_in_layer(layers: List[LayerLens], final_token_id: int) -> Optional[Lay
         else:
             break
     return lock
+
+
+# --------------------------------------------------------------------------
+# Ablation
+# --------------------------------------------------------------------------
+
+# KL in bits between the intact and ablated output distributions. Ablating a
+# single GPT-2 head usually lands well under 0.05, so anything below this is
+# indistinguishable from the component doing nothing on this prompt.
+_NEGLIGIBLE_KL = 0.02
+
+# Above this the component is carrying real weight: ~0.5 bits of divergence
+# means the answer distribution has visibly reshaped, not just jittered.
+_STRONG_KL = 0.5
+
+# Probability swing worth naming in prose.
+_MEANINGFUL_SHIFT = 0.02
+
+
+def narrate_ablation(
+    label: str,
+    effect: AblationEffect,
+    baseline: LensTrace,
+    ablated: LensTrace,
+) -> List[str]:
+    """Describe what switching a component off did, as plain-English findings."""
+    findings: List[str] = []
+    answer = _clean(effect.baseline_answer.token)
+
+    if effect.answer_changed:
+        findings.append(
+            f'Switching off {label} changes the answer: "{answer}" becomes '
+            f'"{_clean(effect.ablated_answer.token)}" ({_pct(effect.ablated_answer.prob)}). '
+            f"This component is load-bearing for this prompt."
+        )
+    elif effect.kl_bits < _NEGLIGIBLE_KL:
+        findings.append(
+            f'{label} makes almost no difference here — {effect.kl_bits:.3f} bits of divergence, '
+            f'and "{answer}" still wins at {_pct(effect.baseline_answer_prob_after)}. '
+            f"On this prompt the model routes around it."
+        )
+    else:
+        findings.append(
+            f'{label} is not decisive — "{answer}" still wins without it — but the output '
+            f"distribution does move: {effect.kl_bits:.2f} bits of divergence from the intact run."
+        )
+
+    if abs(effect.prob_delta) >= _MEANINGFUL_SHIFT:
+        direction = "drops" if effect.prob_delta < 0 else "rises"
+        findings.append(
+            f'Confidence in "{answer}" {direction} from {_pct(effect.baseline_answer.prob)} to '
+            f"{_pct(effect.baseline_answer_prob_after)} — a {abs(effect.prob_delta) * 100:.1f} "
+            f"point swing attributable to {label} alone."
+        )
+
+    divergence = _first_divergence(baseline, ablated)
+    if divergence is not None:
+        base_layer, abl_layer = divergence
+        findings.append(
+            f"The two runs first disagree at {base_layer.label}: intact says "
+            f'"{_clean(base_layer.top[0].token)}", ablated says '
+            f'"{_clean(abl_layer.top[0].token)}". Everything above that layer is identical, '
+            f"which is the expected shape — a component can only affect what comes after it."
+        )
+
+    gainer = next(
+        (
+            s
+            for s in effect.top_shifts
+            if s.delta > 0 and s.token_id != effect.baseline_answer.token_id
+        ),
+        None,
+    )
+    if gainer is not None and gainer.delta >= _MEANINGFUL_SHIFT:
+        findings.append(
+            f'The mass goes to "{_clean(gainer.token)}", which climbs from '
+            f"{_pct(gainer.baseline_prob)} to {_pct(gainer.ablated_prob)}. That is the "
+            f"prediction the model falls back on without {label}."
+        )
+
+    if effect.kl_bits >= _NEGLIGIBLE_KL:
+        findings.append(
+            "One caveat: this measures what the component contributes *given the rest of the "
+            "network is intact*. A component can look unimportant because another one "
+            "compensates, which single-component ablation cannot see."
+        )
+
+    return findings
+
+
+def _first_divergence(
+    baseline: LensTrace, ablated: LensTrace
+) -> Optional[Tuple[LayerLens, LayerLens]]:
+    """First layer where the two runs' leading candidates differ.
+
+    Skips the embedding row, which is identical by construction — no ablation
+    can reach behind the input embeddings.
+    """
+    for base_layer, abl_layer in zip(baseline.layers[1:], ablated.layers[1:]):
+        if base_layer.top[0].token_id != abl_layer.top[0].token_id:
+            return base_layer, abl_layer
+    return None
+
+
+def narrate_attribution(
+    scope: str,
+    components: List[ComponentEffect],
+    baseline_answer: TokenPrediction,
+    layer_label: Optional[str],
+) -> List[str]:
+    """Describe a ranked sweep: what carried the prediction, and what was inert."""
+    if not components:
+        return []
+
+    findings: List[str] = []
+    answer = _clean(baseline_answer.token)
+    kind = "head" if scope == "heads" else "block"
+    where = f" in {layer_label}" if layer_label else ""
+    strongest = components[0]
+
+    findings.append(
+        f'Intact, the model answers "{answer}" at {_pct(baseline_answer.prob)}. Every {kind}'
+        f"{where} was then switched off one at a time and the output distribution re-measured."
+    )
+
+    if strongest.kl_bits < _NEGLIGIBLE_KL:
+        findings.append(
+            f"No single {kind}{where} matters much on this prompt — the strongest, "
+            f"{strongest.label}, only moves the distribution {strongest.kl_bits:.3f} bits. "
+            f"The prediction is spread across the network rather than carried by one {kind}."
+        )
+    else:
+        findings.append(
+            f"{strongest.label} carries the most: removing it costs {strongest.kl_bits:.2f} bits "
+            f'and takes "{answer}" to {_pct(strongest.baseline_answer_prob_after)}'
+            + (
+                f', with "{_clean(strongest.top_token)}" winning instead.'
+                if strongest.answer_changed
+                else "."
+            )
+        )
+
+    flippers = [c for c in components if c.answer_changed]
+    if flippers:
+        listed = ", ".join(c.label for c in flippers[:5])
+        more = "" if len(flippers) <= 5 else f" (+{len(flippers) - 5} more)"
+        findings.append(
+            f"{len(flippers)} {kind}{'s' if len(flippers) != 1 else ''} change the answer outright "
+            f"when removed: {listed}{more}."
+        )
+
+    inert = [c for c in components if c.kl_bits < _NEGLIGIBLE_KL]
+    if inert and len(inert) < len(components):
+        findings.append(
+            f"{len(inert)} of {len(components)} {kind}s are effectively inert here "
+            f"(under {_NEGLIGIBLE_KL} bits). That is normal — most components specialise, "
+            f"and only some of them are relevant to any given prompt."
+        )
+
+    if strongest.kl_bits >= _STRONG_KL:
+        findings.append(
+            f"Read this as importance *on this prompt*, not in general. Re-run with a "
+            f"different prompt and the ranking will usually change — that is the point of "
+            f"the measurement, not a flaw in it."
+        )
+
+    return findings
 
 
 def _clean(token: str) -> str:
