@@ -41,6 +41,8 @@ export interface AnalyzeResponse {
   num_layers: number
   num_heads: number
   truncated: boolean
+  /** Set when the server adjusted the prompt, e.g. trimming whitespace. */
+  prompt_notice: string | null
 }
 
 /** Mirrors `TokenPrediction`. */
@@ -92,6 +94,7 @@ export interface LensResponse {
   final_prediction: TokenPrediction
   narration: string[]
   truncated: boolean
+  prompt_notice: string | null
 }
 
 /** Mirrors `CompareRequest`. */
@@ -119,4 +122,5 @@ export interface CompareResponse {
   delta: number[]
   layers_compared: number
   note: string | null
+  prompt_notice: string | null
 }

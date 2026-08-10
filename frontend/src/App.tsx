@@ -143,6 +143,9 @@ export default function App() {
             <ErrorNote message={`Could not load the model catalog. ${modelsError}`} />
           )}
           {error && <ErrorNote message={error} />}
+          {(lensResult?.prompt_notice ?? result?.prompt_notice) && (
+            <Note>{lensResult?.prompt_notice ?? result?.prompt_notice}</Note>
+          )}
           {result?.truncated && (
             <Note>
               Prompt was truncated to {result.tokens.length} tokens. Attention payloads grow with the

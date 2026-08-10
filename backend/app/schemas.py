@@ -65,6 +65,10 @@ class AnalyzeResponse(Schema):
     num_layers: int = Field(..., description="Number of transformer blocks.")
     num_heads: int = Field(..., description="Attention heads per block.")
     truncated: bool = Field(..., description="True if the prompt was cut to fit the token ceiling.")
+    prompt_notice: Optional[str] = Field(
+        None,
+        description="Set when the server had to adjust the prompt, e.g. trimming whitespace.",
+    )
 
 
 class CompareRequest(Schema):
@@ -93,6 +97,10 @@ class CompareResponse(Schema):
     layers_compared: int
     note: Optional[str] = Field(
         None, description="Set when the two models don't line up exactly (e.g. different depths)."
+    )
+    prompt_notice: Optional[str] = Field(
+        None,
+        description="Set when the server had to adjust the prompt, e.g. trimming whitespace.",
     )
 
 
@@ -177,3 +185,7 @@ class LensResponse(Schema):
         ..., description="Plain-English findings derived from the layer trace."
     )
     truncated: bool
+    prompt_notice: Optional[str] = Field(
+        None,
+        description="Set when the server had to adjust the prompt, e.g. trimming whitespace.",
+    )

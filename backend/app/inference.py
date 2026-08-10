@@ -7,6 +7,7 @@ routes call into these functions and do nothing else.
 import logging
 import os
 import threading
+import unicodedata
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -40,6 +41,9 @@ MAX_PROMPT_TOKENS = int(os.getenv("MAX_PROMPT_TOKENS", "32"))
 # Attention weights are probabilities; 4 decimals is well past what a heatmap
 # can render, and it roughly halves the response size.
 _ROUND_DP = 4
+
+# Longest token string we'll render before eliding.
+_MAX_TOKEN_CHARS = 16
 
 
 class ModelLoadError(RuntimeError):
@@ -131,18 +135,71 @@ def _resolve_token_budget(requested: Optional[int]) -> int:
     return max(1, min(int(requested), MAX_PROMPT_TOKENS))
 
 
-def _display_token(raw: str) -> str:
-    """Turn a GPT-2 BPE token into something readable on a chart axis.
+def _visible_char(char: str) -> str:
+    """Make one character legible, including the ones that render as nothing."""
+    if char == " ":
+        return "␣"
+    if char == "\n":
+        return "⏎"
+    if char == "\t":
+        return "⇥"
+    # Control, format, and exotic-separator codepoints (non-breaking space,
+    # zero-width joiners, byte-order marks) draw as nothing or as a blank box.
+    # Show the codepoint instead so a token is never silently invisible.
+    if unicodedata.category(char)[0] in {"C", "Z"}:
+        return f"<{ord(char):02X}>"
+    return char
 
-    GPT-2 encodes a leading space as 'Ġ' and a newline as 'Ċ'. Rendering those
-    raw makes the heatmap axes unreadable, so map them to visible stand-ins.
+
+def _display_token(tokenizer: PreTrainedTokenizerBase, token_id: int) -> str:
+    """Turn a token id into something readable on a chart axis or in prose.
+
+    Must decode rather than read `convert_ids_to_tokens`. GPT-2 uses byte-level
+    BPE and stores tokens in an internal byte->unicode mapping, so the raw token
+    string for a non-breaking space is the mojibake 'Âł' and for 'ét' it is
+    'Ã©t'. `decode` reverses that mapping; anything else shows users garbage.
     """
-    return raw.replace("Ġ", "␣").replace("Ċ", "⏎")
+    text = tokenizer.decode([int(token_id)])
+    if not text:
+        return "∅"
+    shown = "".join(_visible_char(c) for c in text)
+    # GPT-2's vocabulary contains genuine oddities like a single 64-underscore
+    # token (id 27193) scraped from web forms. Left whole they wreck every
+    # layout they land in.
+    if len(shown) > _MAX_TOKEN_CHARS:
+        return shown[:_MAX_TOKEN_CHARS] + "…"
+    return shown
 
 
-def _forward(loaded: LoadedModel, prompt: str, max_tokens: Optional[int]) -> Tuple[List[str], Any, bool]:
-    """Run one CPU forward pass and return (display tokens, model output, truncated)."""
+def _clean_prompt(prompt: str) -> Tuple[str, Optional[str]]:
+    """Trim surrounding whitespace, and say so when it mattered.
+
+    A trailing space is the single most destructive thing you can do to a
+    next-token prediction. GPT-2 puts the space *inside* the following token
+    (' Paris', not 'Paris'), so a dangling space becomes its own token and the
+    readout position lands on it — you end up asking "what follows a lone
+    space?", which is meaningless, and the model answers with byte fragments.
+    It looks exactly like a broken model.
+    """
+    cleaned = prompt.strip()
+    if cleaned == prompt:
+        return cleaned, None
+    if not cleaned:
+        return cleaned, None
+    return cleaned, (
+        "Trimmed whitespace from your prompt. A trailing space becomes its own "
+        "token, and the prediction would have been read from that space rather "
+        "than from your last real word."
+    )
+
+
+def _forward(
+    loaded: LoadedModel, prompt: str, max_tokens: Optional[int]
+) -> Tuple[List[str], Any, bool, Optional[str]]:
+    """Run one CPU forward pass and return (display tokens, output, truncated, notice)."""
     budget = _resolve_token_budget(max_tokens)
+
+    prompt, notice = _clean_prompt(prompt)
 
     # Tokenize once unbounded to detect truncation honestly, then cut.
     full_ids = loaded.tokenizer.encode(prompt)
@@ -161,8 +218,8 @@ def _forward(loaded: LoadedModel, prompt: str, max_tokens: Optional[int]) -> Tup
             output_hidden_states=True,
         )
 
-    raw_tokens = loaded.tokenizer.convert_ids_to_tokens(input_ids[0].tolist())
-    return [_display_token(t) for t in raw_tokens], outputs, truncated
+    ids = input_ids[0].tolist()
+    return [_display_token(loaded.tokenizer, t) for t in ids], outputs, truncated, notice
 
 
 def _attentions_to_nested(outputs: Any) -> List[List[List[List[float]]]]:
@@ -191,7 +248,7 @@ def _hidden_state_magnitudes(outputs: Any) -> List[float]:
 def analyze(model_id: str, prompt: str, max_tokens: Optional[int] = None) -> AnalyzeResponse:
     """Run one model on one prompt and extract tokens, attention, activations."""
     loaded = load_model(model_id)
-    tokens, outputs, truncated = _forward(loaded, prompt, max_tokens)
+    tokens, outputs, truncated, notice = _forward(loaded, prompt, max_tokens)
 
     return AnalyzeResponse(
         model_id=loaded.info.id,
@@ -201,6 +258,7 @@ def analyze(model_id: str, prompt: str, max_tokens: Optional[int] = None) -> Ana
         num_layers=loaded.num_layers,
         num_heads=loaded.num_heads,
         truncated=truncated,
+        prompt_notice=notice,
     )
 
 
@@ -214,8 +272,8 @@ def compare(
     base = load_model(base_model_id)
     finetuned = load_model(finetuned_model_id)
 
-    base_tokens, base_out, _ = _forward(base, prompt, max_tokens)
-    ft_tokens, ft_out, _ = _forward(finetuned, prompt, max_tokens)
+    base_tokens, base_out, _, notice = _forward(base, prompt, max_tokens)
+    ft_tokens, ft_out, _, _ = _forward(finetuned, prompt, max_tokens)
 
     base_mags = _hidden_state_magnitudes(base_out)
     ft_mags = _hidden_state_magnitudes(ft_out)
@@ -250,6 +308,7 @@ def compare(
         delta=delta,
         layers_compared=shared,
         note=" ".join(notes) if notes else None,
+        prompt_notice=notice,
     )
 
 
@@ -306,7 +365,7 @@ def logit_lens(
     change from layer to layer is the model forming its answer.
     """
     loaded = load_model(model_id)
-    tokens, outputs, truncated = _forward(loaded, prompt, max_tokens)
+    tokens, outputs, truncated, notice = _forward(loaded, prompt, max_tokens)
     norm, head = _output_projection(loaded.model)
 
     hidden = outputs.hidden_states
@@ -338,7 +397,7 @@ def logit_lens(
 
         top = [
             TokenPrediction(
-                token=_display_token(loaded.tokenizer.convert_ids_to_tokens(int(tid))),
+                token=_display_token(loaded.tokenizer, int(tid)),
                 token_id=int(tid),
                 prob=round(float(p), 6),
             )
@@ -370,7 +429,7 @@ def logit_lens(
         peak = int(torch.argmax(series).item())
         trajectories.append(
             TokenTrajectory(
-                token=_display_token(loaded.tokenizer.convert_ids_to_tokens(token_id)),
+                token=_display_token(loaded.tokenizer, token_id),
                 token_id=token_id,
                 probs=[round(float(v), 6) for v in series],
                 peak_layer=peak,
@@ -382,7 +441,7 @@ def logit_lens(
     trajectories.sort(key=lambda t: t.peak_prob, reverse=True)
 
     final_prediction = TokenPrediction(
-        token=_display_token(loaded.tokenizer.convert_ids_to_tokens(final_id)),
+        token=_display_token(loaded.tokenizer, final_id),
         token_id=final_id,
         prob=round(float(final_probs[final_id].item()), 6),
     )
@@ -397,4 +456,5 @@ def logit_lens(
         final_prediction=final_prediction,
         narration=narrate_lens(layers, trajectories, final_prediction, tokens[pos]),
         truncated=truncated,
+        prompt_notice=notice,
     )
