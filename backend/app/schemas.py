@@ -98,3 +98,82 @@ class CompareResponse(Schema):
 
 class ErrorResponse(Schema):
     detail: str
+
+
+# --------------------------------------------------------------------------
+# Logit lens — "what is the model thinking at each layer?"
+# --------------------------------------------------------------------------
+
+
+class TokenPrediction(Schema):
+    """One candidate next-token and the probability the model assigns it."""
+
+    token: str = Field(..., description="Display-ready token string.")
+    token_id: int
+    prob: float = Field(..., description="Softmax probability, 0-1.")
+
+
+class LayerLens(Schema):
+    """The model's best guess read out of one layer's residual stream."""
+
+    layer: int = Field(..., description="Hidden-state index. 0 is the embedding output.")
+    label: str = Field(..., description="Short display label: 'embed', 'L1', 'L2'…")
+    top: List[TokenPrediction] = Field(..., description="Top-k candidates at this layer.")
+    entropy: float = Field(
+        ...,
+        description=(
+            "Shannon entropy of the full distribution, in bits. High = the model is "
+            "undecided across many tokens; low = it has committed."
+        ),
+    )
+    target_prob: float = Field(
+        ...,
+        description=(
+            "Probability this layer assigns to the model's FINAL answer. Rising values "
+            "trace the answer forming; this is the line worth animating."
+        ),
+    )
+    changed: bool = Field(..., description="True if the top-1 token differs from the previous layer.")
+
+
+class TokenTrajectory(Schema):
+    """One candidate's probability at every layer.
+
+    Built from the union of all layers' top-k, so a token that leads mid-network
+    and then fades still has a complete, gap-free line to draw.
+    """
+
+    token: str
+    token_id: int
+    probs: List[float] = Field(..., description="Probability at each hidden state, in layer order.")
+    peak_layer: int
+    peak_prob: float
+    final_prob: float
+
+
+class LensRequest(Schema):
+    model_id: str
+    prompt: str = Field(..., min_length=1, max_length=2000)
+    top_k: int = Field(5, ge=1, le=10)
+    position: Optional[int] = Field(
+        None,
+        description="Token position to read out. Defaults to the last token (the one being predicted from).",
+    )
+    max_tokens: Optional[int] = Field(None, ge=1)
+
+
+class LensResponse(Schema):
+    model_id: str
+    display_name: str
+    tokens: List[str]
+    position: int = Field(..., description="Token index the readout was taken at.")
+    layers: List[LayerLens]
+    trajectories: List[TokenTrajectory] = Field(
+        ...,
+        description="Gap-free probability lines for every token that led or placed at any layer.",
+    )
+    final_prediction: TokenPrediction = Field(..., description="What the model actually predicts.")
+    narration: List[str] = Field(
+        ..., description="Plain-English findings derived from the layer trace."
+    )
+    truncated: bool

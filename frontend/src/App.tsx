@@ -6,15 +6,17 @@
 
 import { useEffect, useState } from 'react'
 
-import { analyze, API_BASE_URL, fetchModels } from './api/client'
-import type { AnalyzeResponse, ModelInfo } from './api/types'
+import { analyze, API_BASE_URL, fetchModels, lens } from './api/client'
+import type { AnalyzeResponse, LensResponse, ModelInfo } from './api/types'
 import ActivationChart from './components/ActivationChart'
 import AttentionHeatmap from './components/AttentionHeatmap'
 import CompareView from './components/CompareView'
+import LogitLens from './components/LogitLens'
 import ModelSelector from './components/ModelSelector'
 import { Button, ErrorNote, Note } from './components/ui'
 
 const TABS = [
+  { id: 'lens', label: 'Watch it think' },
   { id: 'attention', label: 'Attention' },
   { id: 'activations', label: 'Activations' },
   { id: 'compare', label: 'Compare' },
@@ -31,10 +33,11 @@ export default function App() {
 
   const [prompt, setPrompt] = useState(DEFAULT_PROMPT)
   const [result, setResult] = useState<AnalyzeResponse | null>(null)
+  const [lensResult, setLensResult] = useState<LensResponse | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
-  const [tab, setTab] = useState<TabId>('attention')
+  const [tab, setTab] = useState<TabId>('lens')
 
   useEffect(() => {
     let cancelled = false
@@ -58,14 +61,31 @@ export default function App() {
     if (!canRun) return
     setLoading(true)
     setError(null)
-    try {
-      setResult(await analyze({ model_id: modelId, prompt }))
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err))
+
+    // Both views come from one click. allSettled rather than all: a model that
+    // can't be lensed should still render its attention and activations.
+    const [analyzed, lensed] = await Promise.allSettled([
+      analyze({ model_id: modelId, prompt }),
+      lens({ model_id: modelId, prompt, top_k: 5 }),
+    ])
+
+    if (analyzed.status === 'fulfilled') {
+      setResult(analyzed.value)
+    } else {
       setResult(null)
-    } finally {
-      setLoading(false)
+      setError(errorText(analyzed.reason))
     }
+
+    if (lensed.status === 'fulfilled') {
+      setLensResult(lensed.value)
+    } else {
+      setLensResult(null)
+      // Only surface the lens failure if it's the only thing that broke,
+      // otherwise the analyze error already explains the problem.
+      if (analyzed.status === 'fulfilled') setError(errorText(lensed.reason))
+    }
+
+    setLoading(false)
   }
 
   return (
@@ -147,6 +167,7 @@ export default function App() {
             ))}
           </nav>
 
+          {tab === 'lens' && <LogitLens result={lensResult} />}
           {tab === 'attention' && <AttentionHeatmap result={result} />}
           {tab === 'activations' && <ActivationChart result={result} />}
           {tab === 'compare' && (
@@ -161,6 +182,10 @@ export default function App() {
       </div>
     </div>
   )
+}
+
+function errorText(reason: unknown): string {
+  return reason instanceof Error ? reason.message : String(reason)
 }
 
 function Header({ modelCount }: { modelCount: number }) {

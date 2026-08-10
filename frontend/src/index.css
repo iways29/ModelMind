@@ -21,8 +21,11 @@
   --color-delta-accent: #a78bfa;
   --color-danger: #fb7185;
 
-  --font-mono: 'SF Mono', 'JetBrains Mono', ui-monospace, 'Menlo', monospace;
-  --font-sans: 'Inter', ui-sans-serif, -apple-system, 'Segoe UI', system-ui, sans-serif;
+  /* Data is mono because this is an instrument; headings are a serif so the
+     thing reads like a lab notebook rather than a terminal. */
+  --font-mono: 'IBM Plex Mono', 'SF Mono', ui-monospace, 'Menlo', monospace;
+  --font-display: 'Instrument Serif', 'Iowan Old Style', Georgia, serif;
+  --font-sans: 'IBM Plex Mono', ui-monospace, 'Menlo', monospace;
 }
 
 html,
@@ -70,4 +73,95 @@ select,
 input,
 textarea {
   color-scheme: dark;
+}
+
+/* --------------------------------------------------------------------------
+   Motion vocabulary for the lens view.
+
+   The encodings are semantic, not decorative: a layer's glow tracks how much
+   probability it puts on the final answer, and its blur tracks entropy — an
+   undecided layer is literally out of focus, a committed one is a tight point.
+   -------------------------------------------------------------------------- */
+
+@keyframes breathe {
+  0%,
+  100% {
+    transform: scale(1);
+    opacity: 0.85;
+  }
+  50% {
+    transform: scale(1.14);
+    opacity: 1;
+  }
+}
+
+/* A charge running down the spine, from embeddings toward the answer. */
+@keyframes descend {
+  0% {
+    transform: translateY(-100%);
+    opacity: 0;
+  }
+  12% {
+    opacity: 1;
+  }
+  88% {
+    opacity: 1;
+  }
+  100% {
+    transform: translateY(1100%);
+    opacity: 0;
+  }
+}
+
+@keyframes settle {
+  from {
+    opacity: 0;
+    transform: translateY(-10px);
+    filter: blur(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+    filter: blur(0);
+  }
+}
+
+@keyframes trace {
+  from {
+    stroke-dashoffset: var(--trace-length);
+  }
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+
+.animate-breathe {
+  animation: breathe 3.4s ease-in-out infinite;
+}
+.animate-descend {
+  animation: descend 3.6s cubic-bezier(0.45, 0, 0.55, 1) infinite;
+}
+.animate-settle {
+  animation: settle 0.5s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+.animate-trace {
+  stroke-dasharray: var(--trace-length);
+  animation: trace 1.5s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+/* Vestibular safety: keep the meaning, drop the movement. */
+@media (prefers-reduced-motion: reduce) {
+  .animate-breathe,
+  .animate-descend,
+  .animate-settle,
+  .animate-trace {
+    animation: none !important;
+  }
+  .animate-trace {
+    stroke-dasharray: none;
+  }
+  .animate-settle {
+    opacity: 1;
+    filter: none;
+  }
 }

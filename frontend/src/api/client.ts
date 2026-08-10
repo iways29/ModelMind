@@ -10,6 +10,8 @@ import type {
   AnalyzeResponse,
   CompareRequest,
   CompareResponse,
+  LensRequest,
+  LensResponse,
   ModelInfo,
 } from './types'
 
@@ -82,6 +84,11 @@ export function fetchModels(): Promise<ModelInfo[]> {
 /** POST /analyze — tokens, attention, and per-layer activations for one model. */
 export function analyze(body: AnalyzeRequest): Promise<AnalyzeResponse> {
   return post<AnalyzeResponse>('/analyze', body)
+}
+
+/** POST /lens — the model's predicted next token decoded at every layer. */
+export function lens(body: LensRequest): Promise<LensResponse> {
+  return post<LensResponse>('/lens', body)
 }
 
 /** POST /compare — two models on one prompt, plus their per-layer delta. */

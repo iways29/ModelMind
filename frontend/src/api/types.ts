@@ -43,6 +43,57 @@ export interface AnalyzeResponse {
   truncated: boolean
 }
 
+/** Mirrors `TokenPrediction`. */
+export interface TokenPrediction {
+  token: string
+  token_id: number
+  prob: number
+}
+
+/** Mirrors `LayerLens` — the model's guess read out of one layer. */
+export interface LayerLens {
+  layer: number
+  label: string
+  top: TokenPrediction[]
+  /** Shannon entropy in bits. High = undecided across many tokens. */
+  entropy: number
+  /** Probability this layer assigns to the model's FINAL answer. */
+  target_prob: number
+  changed: boolean
+}
+
+/** Mirrors `TokenTrajectory` — one candidate's gap-free probability line. */
+export interface TokenTrajectory {
+  token: string
+  token_id: number
+  probs: number[]
+  peak_layer: number
+  peak_prob: number
+  final_prob: number
+}
+
+/** Mirrors `LensRequest`. */
+export interface LensRequest {
+  model_id: string
+  prompt: string
+  top_k?: number
+  position?: number
+  max_tokens?: number
+}
+
+/** Mirrors `LensResponse`. */
+export interface LensResponse {
+  model_id: string
+  display_name: string
+  tokens: string[]
+  position: number
+  layers: LayerLens[]
+  trajectories: TokenTrajectory[]
+  final_prediction: TokenPrediction
+  narration: string[]
+  truncated: boolean
+}
+
 /** Mirrors `CompareRequest`. */
 export interface CompareRequest {
   base_model_id: string

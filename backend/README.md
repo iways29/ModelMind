@@ -18,10 +18,11 @@ Interactive docs: <http://127.0.0.1:8000/docs>
 
 | File | Responsibility |
 | --- | --- |
-| `app/main.py` | FastAPI app, CORS, three routes. Validates and delegates — no model code. |
+| `app/main.py` | FastAPI app, CORS, four routes. Validates and delegates — no model code. |
 | `app/inference.py` | Everything that touches `torch`/`transformers`: loading, caching, forward pass, extraction. |
 | `app/models.py` | The hardcoded catalog and id lookup. |
 | `app/schemas.py` | Pydantic request/response models. The HTTP contract lives here. |
+| `app/insights.py` | Turns a finished layer trace into plain-English findings. Pure functions, no torch. |
 
 The one architectural rule: routes never contain inference logic, and
 `inference.py` never imports FastAPI.
@@ -45,6 +46,27 @@ Returns the catalog as `ModelInfo[]`:
 Returns `tokens`, `attentions` (layer → head → seq × seq), and
 `hidden_state_magnitudes` (mean absolute activation per hidden state), plus
 `num_layers`, `num_heads`, and `truncated`.
+
+### `POST /lens`
+
+```json
+{ "model_id": "gpt2", "prompt": "The capital of France is", "top_k": 5 }
+```
+
+The logit lens: projects every layer's residual stream through the model's own
+final norm + unembedding to get a next-token distribution per layer. Returns
+`layers` (top-k, entropy in bits, and the probability that layer assigns the
+final answer), `trajectories` (gap-free probability lines built from the union
+of all layers' top-k, so a token that leads at L10 and drops out by L12 still
+has a complete series), `final_prediction`, and `narration`.
+
+Two correctness details worth preserving if you edit `logit_lens`:
+
+- The **last** hidden state is already post-`ln_f`. Norming it again silently
+  corrupts the final distribution — it must pass through untouched.
+- The **embedding** row is an artifact. GPT-2 ties input and output embeddings,
+  so the lens there recovers the input token at ~100%. It is not a prediction,
+  and `insights.py` excludes it from every baseline it computes.
 
 ### `POST /compare`
 

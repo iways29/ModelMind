@@ -13,8 +13,17 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
 
+from .insights import narrate_lens
 from .models import ModelInfo, get_model
-from .schemas import AnalyzeResponse, CompareResponse, ModelMagnitudes
+from .schemas import (
+    AnalyzeResponse,
+    CompareResponse,
+    LayerLens,
+    LensResponse,
+    ModelMagnitudes,
+    TokenPrediction,
+    TokenTrajectory,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +48,10 @@ class ModelLoadError(RuntimeError):
 
 class EmptyPromptError(ValueError):
     """Raised when a prompt contains no tokens the model can consume."""
+
+
+class LensUnsupportedError(RuntimeError):
+    """Raised when a model doesn't expose the final norm + output head the lens needs."""
 
 
 @dataclass(frozen=True)
@@ -237,4 +250,151 @@ def compare(
         delta=delta,
         layers_compared=shared,
         note=" ".join(notes) if notes else None,
+    )
+
+
+# --------------------------------------------------------------------------
+# Logit lens
+# --------------------------------------------------------------------------
+
+
+def _output_projection(model: PreTrainedModel) -> Tuple[Any, Any]:
+    """Find the final layer norm and the unembedding head.
+
+    The logit lens works by taking a *mid-network* residual stream and pushing
+    it through the same two operations the model uses at the very end. Attribute
+    names differ across architectures, so probe for the common spellings rather
+    than hardcoding GPT-2's — this is the seam that lets arbitrary models work
+    later.
+    """
+    head = getattr(model, "lm_head", None)
+    base = getattr(model, "transformer", None) or getattr(model, "model", None)
+
+    norm = None
+    if base is not None:
+        for attr in ("ln_f", "norm", "final_layer_norm", "final_norm"):
+            norm = getattr(base, attr, None)
+            if norm is not None:
+                break
+
+    if head is None or norm is None:
+        raise LensUnsupportedError(
+            f"{model.__class__.__name__} does not expose a final norm + lm_head pair, "
+            "so its residual stream can't be projected to vocabulary space."
+        )
+    return norm, head
+
+
+def _entropy_bits(probs: torch.Tensor) -> float:
+    """Shannon entropy in bits. Low means the model has committed to an answer."""
+    safe = probs.clamp_min(1e-12)
+    return float(-(safe * safe.log2()).sum().item())
+
+
+def logit_lens(
+    model_id: str,
+    prompt: str,
+    top_k: int = 5,
+    position: Optional[int] = None,
+    max_tokens: Optional[int] = None,
+) -> LensResponse:
+    """Decode what the model 'believes' the next token is, at every layer.
+
+    At each hidden state we run the residual stream through the final layer norm
+    and the unembedding matrix — the same path the last layer takes — and read
+    off a probability distribution over the vocabulary. Watching the top-1
+    change from layer to layer is the model forming its answer.
+    """
+    loaded = load_model(model_id)
+    tokens, outputs, truncated = _forward(loaded, prompt, max_tokens)
+    norm, head = _output_projection(loaded.model)
+
+    hidden = outputs.hidden_states
+    last_index = len(hidden) - 1
+    pos = len(tokens) - 1 if position is None else max(0, min(int(position), len(tokens) - 1))
+
+    def distribution(layer_index: int) -> torch.Tensor:
+        resid = hidden[layer_index][0, pos]
+        # GPT-2's last hidden state has already been through ln_f. Norming it a
+        # second time distorts the distribution, so pass it straight through.
+        normed = resid if layer_index == last_index else norm(resid)
+        with torch.no_grad():
+            return torch.softmax(head(normed).float(), dim=-1)
+
+    # Compute every layer's distribution up front. 13 x 50k floats is ~2.6 MB —
+    # cheap, and it lets us build gap-free trajectories in one pass instead of
+    # re-running the projection per token of interest.
+    per_layer = [distribution(i) for i in range(len(hidden))]
+
+    # The final layer's argmax is the model's actual answer; every earlier layer
+    # is scored against it so we can watch that answer's probability grow.
+    final_probs = per_layer[last_index]
+    final_id = int(torch.argmax(final_probs).item())
+
+    layers: List[LayerLens] = []
+    previous_top: Optional[int] = None
+    for i, probs in enumerate(per_layer):
+        top_probs, top_ids = torch.topk(probs, top_k)
+
+        top = [
+            TokenPrediction(
+                token=_display_token(loaded.tokenizer.convert_ids_to_tokens(int(tid))),
+                token_id=int(tid),
+                prob=round(float(p), 6),
+            )
+            for p, tid in zip(top_probs, top_ids)
+        ]
+        current_top = int(top_ids[0].item())
+
+        layers.append(
+            LayerLens(
+                layer=i,
+                label="embed" if i == 0 else f"L{i}",
+                top=top,
+                entropy=round(_entropy_bits(probs), 4),
+                target_prob=round(float(probs[final_id].item()), 6),
+                changed=previous_top is not None and current_top != previous_top,
+            )
+        )
+        previous_top = current_top
+
+    # Union of everything that placed anywhere, so a token like "Paris" that
+    # leads at L10 and drops out of the top-k by L12 still has a complete line.
+    candidate_ids = sorted({p.token_id for layer in layers for p in layer.top})
+    index = torch.tensor(candidate_ids, dtype=torch.long)
+    stacked = torch.stack([probs[index] for probs in per_layer])  # (layers, candidates)
+
+    trajectories: List[TokenTrajectory] = []
+    for column, token_id in enumerate(candidate_ids):
+        series = stacked[:, column]
+        peak = int(torch.argmax(series).item())
+        trajectories.append(
+            TokenTrajectory(
+                token=_display_token(loaded.tokenizer.convert_ids_to_tokens(token_id)),
+                token_id=token_id,
+                probs=[round(float(v), 6) for v in series],
+                peak_layer=peak,
+                peak_prob=round(float(series[peak].item()), 6),
+                final_prob=round(float(series[-1].item()), 6),
+            )
+        )
+    # Strongest first, so the frontend can draw the top N and drop the tail.
+    trajectories.sort(key=lambda t: t.peak_prob, reverse=True)
+
+    final_prediction = TokenPrediction(
+        token=_display_token(loaded.tokenizer.convert_ids_to_tokens(final_id)),
+        token_id=final_id,
+        prob=round(float(final_probs[final_id].item()), 6),
+    )
+
+    return LensResponse(
+        model_id=loaded.info.id,
+        display_name=loaded.info.display_name,
+        tokens=tokens,
+        position=pos,
+        layers=layers,
+        trajectories=trajectories,
+        final_prediction=final_prediction,
+        narration=narrate_lens(layers, trajectories, final_prediction, tokens[pos]),
+        truncated=truncated,
     )

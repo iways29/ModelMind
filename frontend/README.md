@@ -21,6 +21,8 @@ src/
 │   ├── client.ts     # the only module that calls fetch
 │   └── types.ts      # hand-mirrored copies of the Pydantic schemas
 ├── components/
+│   ├── LogitLens.tsx         # "watch it think" — the residual stream as a column
+│   ├── TrajectoryRibbon.tsx  # racing token probabilities (hand-rolled SVG)
 │   ├── ActivationChart.tsx   # per-layer activation magnitude (nivo line)
 │   ├── AttentionHeatmap.tsx  # token x token attention (nivo heatmap)
 │   ├── CompareView.tsx       # base vs fine-tuned vs delta
@@ -50,6 +52,25 @@ Two details worth knowing if you edit `AttentionHeatmap`:
 - The colour ramp is a custom interpolator in `chartTheme.ts` rather than a
   built-in nivo scheme, so `t = 0` lands exactly on the panel background and
   zero-attention cells read as empty rather than as data.
+
+## The lens view
+
+`LogitLens` draws the residual stream top-to-bottom: embeddings in, answer out.
+The orientation is a reading-order choice; the structure is the real one.
+
+Its two encodings are semantic, not decorative — keep them that way if you edit it:
+
+| Visual | Means |
+| --- | --- |
+| luminosity / node size | probability that layer assigns the final answer |
+| blur | entropy — an undecided layer is literally out of focus |
+
+`TrajectoryRibbon` is hand-rolled SVG rather than nivo because it needs per-line
+glow, labels anchored at each line's *peak* rather than its end, and vertical
+de-collision (most candidates finish near 0% and would otherwise stack on one
+pixel row). That's fighting a charting library, not using one.
+
+All motion is gated behind `prefers-reduced-motion`.
 
 ## Keeping types in sync
 

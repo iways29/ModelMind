@@ -17,6 +17,8 @@ from .schemas import (
     AnalyzeResponse,
     CompareRequest,
     CompareResponse,
+    LensRequest,
+    LensResponse,
     ModelInfo,
 )
 
@@ -65,6 +67,27 @@ def post_analyze(request: AnalyzeRequest) -> AnalyzeResponse:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except inference.EmptyPromptError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except inference.ModelLoadError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@app.post("/lens", response_model=LensResponse)
+def post_lens(request: LensRequest) -> LensResponse:
+    """Decode the model's predicted next token at every layer, not just the last."""
+    try:
+        return inference.logit_lens(
+            request.model_id,
+            request.prompt,
+            top_k=request.top_k,
+            position=request.position,
+            max_tokens=request.max_tokens,
+        )
+    except models.UnknownModelError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except inference.EmptyPromptError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except inference.LensUnsupportedError as exc:
+        raise HTTPException(status_code=501, detail=str(exc)) from exc
     except inference.ModelLoadError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
