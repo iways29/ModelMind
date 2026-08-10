@@ -1,0 +1,16 @@
+# Web layer
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.30,<1.0
+pydantic>=2.7,<3.0
+
+# Model layer. torch is CPU-only here; on Apple Silicon pip installs the
+# universal wheel and no extra index URL is needed.
+torch>=2.2
+transformers>=4.44,<5.0
+
+# Fast tokenizer backend for GPT-2 BPE. transformers can fall back to the slow
+# Python tokenizer, but it's noticeably slower and warns on every load.
+tokenizers>=0.19
+
+# Hub client used by from_pretrained to fetch checkpoints on first run.
+huggingface_hub>=0.24

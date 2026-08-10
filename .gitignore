@@ -1,0 +1,35 @@
+# ---------- Python / backend ----------
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Hugging Face weights, if HF_HOME is pointed inside the repo
+.cache/
+models_cache/
+
+# ---------- Node / frontend ----------
+node_modules/
+dist/
+dist-ssr/
+.vite/
+*.tsbuildinfo
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ---------- Local env ----------
+.env
+.env.local
+.env.*.local
+
+# ---------- Editors / OS ----------
+.DS_Store
+.idea/
+.vscode/
+*.swp
