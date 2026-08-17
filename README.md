@@ -109,47 +109,56 @@ Try `The capital of France is`: GPT-2 puts 62% on `France` and 18% on `Paris` at
 layer 10, then throws it away by layer 12 to predict `the`. The knowledge is in
 there; the last block spends it on grammar.
 
-**Ablate** — the counterfactual. Switch a component off, re-run the same prompt,
-and diff against the intact model. A whole block is skipped so the residual
-stream passes through untouched; a single head has its slice of the attention
-output zeroed before `c_proj` mixes the heads together, which is the last moment
-the heads are still separable.
+**Find the cause** — two questions the rest of the app can't answer, both causal.
 
-This is the only view that answers *what the answer depended on* rather than
-*when it formed*. On `The capital of France is`, ablating **L12** — the block
-that spends the answer on grammar — flips the prediction back from `the` (8%) to
-`France` (24%), and the layer trace shows the two runs identical until exactly
-that block. Ablating **L5** yields `Paris`.
+*What built this answer* splits the prediction into one number per part of the
+network, in a single forward pass. The residual stream is a running sum — every
+part adds into it and nothing is overwritten — and the read-out is linear, so the
+answer's margin over the runner-up decomposes exactly. The panel prints the
+reconciliation, because a split that didn't add back up to the real margin would
+be a guess dressed as a measurement.
 
-Effect size is KL(intact ‖ ablated) over the full vocabulary, in bits. Zero means
-the component made no difference to this prompt.
+It's measured as a *difference* between two tokens rather than one token's raw
+logit: adding a constant to every logit leaves the model's answer unchanged, so a
+single logit means nothing on its own. Shares can exceed 100% — that isn't an
+error, it's parts cancelling each other out, and the narration says so when it
+happens.
 
-**Rank by contribution** sits under the same tab: it ablates each component in
-turn and ranks them. `All blocks` is one run per block, `Heads in L…` is one run
-per head in the selected block — a dozen CPU forward passes, under a second.
-Single ablation answers "did this matter?"; only the sweep answers "which one
-mattered?", which is not a question you can brute-force by hand across 144 heads.
-Bars are square-rooted because block 0 scores an order of magnitude above
-everything else; the exact figure is printed next to each one.
+Heads are a drill-down on the attention rows. Each head owns a disjoint slice of
+the attention output and therefore a disjoint band of the output projection, so
+its contribution can be recovered exactly — but only before `c_proj` sums them,
+which is the last moment the heads are separable at all.
 
-Two honest limits it states rather than hides: an effect is measured *on this
-prompt*, so the ranking moves when the prompt does; and a component can look
-inert because another one compensates, which single-component ablation cannot
-see.
+*What changed vs another model* reverts one part of your model to another
+checkpoint's weights, leaves everything else alone, and re-runs. If the behaviour
+comes back, that part was carrying it. This is a weight swap rather than an
+activation transplant on purpose: transplanting activations replaces the whole
+residual stream at that depth, which carries everything the earlier blocks did
+too, so it measures the accumulated difference up to that point rather than the
+part itself.
+
+The sweep covers the embeddings and the read-out alongside the blocks. Leaving
+them out would be a quiet lie — a fine-tune that moved its output embedding shows
+nothing anywhere in a block sweep, and "the change isn't in the blocks" reads
+identically to "there is no change to find". Swapping every target at once
+reproduces the donor exactly, which is the property that makes the sweep
+trustworthy.
+
+Against `lvwerra/gpt2-imdb` on *"My review of the restaurant:"*, every one of the
+12 blocks recovers ~0% and the **read-out recovers 28%** — the fine-tune changed
+how the model words things, not what it knows. **Read** on that row generates the
+proof: the fine-tune writes *"The best thing about this movie is…"*, and with the
+read-out reverted the same model writes *"The restaurant is a little too cozy,
+but it's not too bad. The food is good…"*. The movie obsession is gone.
+
+Two honest limits: an effect is measured *on this prompt*, so the ranking moves
+when the prompt does; and reverting parts one at a time cannot see a change
+spread thinly across many of them, which is what a broad fine-tune often is.
 
 **Attention** — a token × token heatmap for one (layer, head) pair, with real
 token labels on both axes. Rows are query tokens, columns are keys. The upper
 triangle is empty because GPT-2 is causal and cannot attend forward. `␣` marks
 a leading space in the BPE vocabulary and `⏎` a newline.
-
-**Activations** — mean absolute activation at each hidden state, x = layer.
-Index 0 is the embedding output. The last point is measured after GPT-2's final
-layer norm, so it drops rather than continuing the ramp — architecture, not a
-bug.
-
-**Compare** — two checkpoints on one prompt, drawn as three lines: base,
-fine-tuned, and the per-layer delta. Comparing `gpt2` against `lvwerra/gpt2-imdb`
-on a movie-review-shaped prompt is the intended demo.
 
 ## Models
 
@@ -163,29 +172,31 @@ All four are GPT-2 architecture, verified against the Hugging Face Hub API
 | `dialogpt-small` | `microsoft/DialoGPT-small` | 12 |
 | `gpt2-medium` | `openai-community/gpt2-medium` | 24 |
 
-Comparing models of different depth (`gpt2` vs `gpt2-medium`) works — the delta
-covers the shared prefix and the response carries a note saying so.
+Reverting weights requires matching depth and width, so `gpt2-medium` can't be
+paired with the 12-block checkpoints — the API says so rather than returning a
+meaningless number.
 
 ## API
 
 | Method | Path | Body | Returns |
 | --- | --- | --- | --- |
 | `GET` | `/models` | — | `ModelInfo[]` |
-| `POST` | `/analyze` | `{model_id, prompt}` | `{tokens, attentions, hidden_state_magnitudes, …}` |
+| `POST` | `/analyze` | `{model_id, prompt}` | `{tokens, attentions, num_layers, num_heads}` |
 | `POST` | `/lens` | `{model_id, prompt, top_k?}` | per-layer top-k predictions, gap-free `trajectories`, and `narration` |
 | `POST` | `/behavior` | `{model_id, prompts[], compare_model_id?}` | per-prompt continuations, divergence point, drift score |
-| `POST` | `/ablate` | `{model_id, prompt, ablations[]}` | `baseline` and `ablated` traces + an `effect` block |
-| `POST` | `/attribution` | `{model_id, prompt, scope, layer?}` | `components` ranked by `kl_bits` |
-| `POST` | `/compare` | `{base_model_id, finetuned_model_id, prompt}` | both profiles + per-layer `delta` |
+| `POST` | `/attribution` | `{model_id, prompt, contrast_token_id?}` | `blocks` and `heads`, each a signed logit contribution |
+| `POST` | `/patch` | `{recipient_model_id, donor_model_id, prompt, layer?}` | one `recovery` per part, plus generated text when `layer` is named |
 
 `attentions` is nested layer → head → seq × seq.
 
-An ablation is `{layer, head?}`; omit `head` to skip the whole block. `layer` is
-the honest 0-based block index, while every display label is shifted by one so a
-block is named after the residual row it writes — block 11 reads as `L12`, the
-same row the lens shows it landing in. Numbering both 0-based made every ablation
-look off by one. `scope` is `"layers"` (one run per block) or `"heads"` (one run
-per head, needs `layer`).
+`layer` is the honest 0-based block index, while every display label is shifted
+by one so a block is named after the residual row it writes — block 11 reads as
+`L12`, the same row the lens shows it landing in. Numbering both 0-based made
+every intervention look off by one.
+
+`/patch` addresses any part of the model with a single integer: `-1` is the
+embeddings, `0…n-1` are the blocks, and `n` is the read-out. Omit `layer` to
+sweep everything; name one to also get generated text for that swap.
 
 ## How the code is organised
 
@@ -196,16 +207,18 @@ Two rules, enforced by hand:
    never imports FastAPI.
 2. **No API logic in React components.** `src/api/client.ts` is the only module
    that calls `fetch`. Components receive data as props or call
-   `analyze`/`compare`/`fetchModels`.
+   `analyze`/`lens`/`attribution`/`patch`/`behavior`/`fetchModels`.
 
 Analysis that produces *prose* rather than numbers lives in
 `backend/app/insights.py`, which is deliberately torch-free — it takes a
 finished layer trace and returns sentences, so it can be reasoned about and
 changed without touching inference.
 
-Ablation hooks are installed by a context manager (`_ablated`) and torn down in
-a `finally`. The model is a process-wide cached singleton, so a hook that
-outlived its request would silently corrupt every later run.
+Every intervention — the attribution hooks and the weight swaps behind `/patch`
+— is installed by a context manager and torn down in a `finally`. The models are
+process-wide cached singletons, so a hook or a swap that outlived its request
+would silently corrupt every later run, and a half-reverted checkpoint is a
+chimera of two models that reports itself as one.
 
 `/behavior` is the only endpoint that generates text. It batches with **left**
 padding built by hand: decoder-only models continue from the last position, so

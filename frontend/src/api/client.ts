@@ -1,24 +1,22 @@
 /**
  * The only module in the app that knows the backend exists.
  *
- * Components import the three functions at the bottom and never call `fetch`
+ * Components import the functions at the bottom and never call `fetch`
  * themselves.
  */
 
 import type {
-  AblateRequest,
-  AblateResponse,
   AnalyzeRequest,
   AnalyzeResponse,
   AttributionRequest,
   AttributionResponse,
   BehaviorRequest,
   BehaviorResponse,
-  CompareRequest,
-  CompareResponse,
   LensRequest,
   LensResponse,
   ModelInfo,
+  PatchRequest,
+  PatchResponse,
 } from './types'
 
 /**
@@ -97,22 +95,17 @@ export function lens(body: LensRequest): Promise<LensResponse> {
   return post<LensResponse>('/lens', body)
 }
 
-/** POST /ablate — the same prompt with components switched off, diffed against intact. */
-export function ablate(body: AblateRequest): Promise<AblateResponse> {
-  return post<AblateResponse>('/ablate', body)
-}
-
-/** POST /attribution — ablate every block, or every head in one block, ranked by effect. */
+/** POST /attribution — the answer split into one number per part of the network. */
 export function attribution(body: AttributionRequest): Promise<AttributionResponse> {
   return post<AttributionResponse>('/attribution', body)
+}
+
+/** POST /patch — each part of one model reverted to another's weights, and what changed. */
+export function patch(body: PatchRequest): Promise<PatchResponse> {
+  return post<PatchResponse>('/patch', body)
 }
 
 /** POST /behavior — real generated text for many prompts, diffed between two models. */
 export function behavior(body: BehaviorRequest): Promise<BehaviorResponse> {
   return post<BehaviorResponse>('/behavior', body)
-}
-
-/** POST /compare — two models on one prompt, plus their per-layer delta. */
-export function compare(body: CompareRequest): Promise<CompareResponse> {
-  return post<CompareResponse>('/compare', body)
 }

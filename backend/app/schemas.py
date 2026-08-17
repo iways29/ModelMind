@@ -54,50 +54,9 @@ class AnalyzeResponse(Schema):
         ...,
         description="layer -> head -> seq x seq attention weights (rows are queries).",
     )
-    hidden_state_magnitudes: List[float] = Field(
-        ...,
-        description=(
-            "Mean absolute activation per layer. Index 0 is the embedding output, "
-            "index i>0 is the output of transformer block i. The final entry is "
-            "measured after GPT-2's final layer norm, so it dips."
-        ),
-    )
     num_layers: int = Field(..., description="Number of transformer blocks.")
     num_heads: int = Field(..., description="Attention heads per block.")
     truncated: bool = Field(..., description="True if the prompt was cut to fit the token ceiling.")
-    prompt_notice: Optional[str] = Field(
-        None,
-        description="Set when the server had to adjust the prompt, e.g. trimming whitespace.",
-    )
-
-
-class CompareRequest(Schema):
-    base_model_id: str
-    finetuned_model_id: str
-    prompt: str = Field(..., min_length=1, max_length=2000)
-    max_tokens: Optional[int] = Field(None, ge=1)
-
-
-class ModelMagnitudes(Schema):
-    """Per-layer activation profile for one model in a comparison."""
-
-    model_id: str
-    display_name: str
-    hidden_state_magnitudes: List[float]
-
-
-class CompareResponse(Schema):
-    prompt: str
-    tokens: List[str] = Field(..., description="Tokenization from the base model.")
-    base: ModelMagnitudes
-    finetuned: ModelMagnitudes
-    delta: List[float] = Field(
-        ..., description="finetuned[i] - base[i], over the layers the two models share."
-    )
-    layers_compared: int
-    note: Optional[str] = Field(
-        None, description="Set when the two models don't line up exactly (e.g. different depths)."
-    )
     prompt_notice: Optional[str] = Field(
         None,
         description="Set when the server had to adjust the prompt, e.g. trimming whitespace.",
@@ -192,147 +151,51 @@ class LensResponse(Schema):
 
 
 # --------------------------------------------------------------------------
-# Ablation — "what does the model predict if this component never fired?"
+# Attribution — which parts of the network built this answer
+#
+# The residual stream is a *sum*: every block writes into it and nothing is
+# overwritten. The final read-out is linear. So the answer's logit decomposes
+# exactly into one number per component — no ablation, no re-running, one pass.
 # --------------------------------------------------------------------------
 
 
-class Ablation(Schema):
-    """One component to switch off for the duration of a forward pass.
-
-    `layer` is the honest 0-based block index. Display labels shift by one so a
-    block is named after the residual-stream row it writes — block 4 is "L5",
-    the same row the lens shows it landing in.
-    """
-
-    layer: int = Field(..., ge=0, description="Transformer block index, 0-based.")
-    head: Optional[int] = Field(
-        None,
-        ge=0,
-        description=(
-            "Attention head within that block. Omit to ablate the whole block, which "
-            "passes the residual stream through untouched as if the layer weren't there."
-        ),
-    )
-
-
 class LensTrace(Schema):
-    """The layer-by-layer readout of a single forward pass.
-
-    Shared shape so a baseline run and an ablated run can be drawn by the same
-    component with no branching.
-    """
+    """The layer-by-layer readout of a single forward pass."""
 
     layers: List[LayerLens]
     trajectories: List[TokenTrajectory]
     final_prediction: TokenPrediction
 
 
-class TokenShift(Schema):
-    """How one candidate's final-layer probability moved under ablation."""
+class Contribution(Schema):
+    """One component's signed push toward the answer, in logits."""
 
-    token: str
-    token_id: int
-    baseline_prob: float
-    ablated_prob: float
-    delta: float = Field(..., description="ablated_prob - baseline_prob. Negative means suppressed.")
-
-
-class AblationEffect(Schema):
-    """Scalar summary of what switching a component off did to the answer."""
-
-    answer_changed: bool = Field(
-        ..., description="True if the ablated run's top-1 differs from the baseline's."
-    )
-    baseline_answer: TokenPrediction
-    ablated_answer: TokenPrediction = Field(
-        ..., description="The ablated run's own top-1, which may be a different token."
-    )
-    baseline_answer_prob_after: float = Field(
-        ...,
-        description="Probability the ablated run still assigns to the BASELINE answer token.",
-    )
-    prob_delta: float = Field(
+    kind: str = Field(..., description="'embed', 'attn', 'mlp', or 'head'.")
+    layer: Optional[int] = Field(None, description="0-based block index; None for 'embed'.")
+    head: Optional[int] = Field(None, description="Set only when kind is 'head'.")
+    label: str = Field(..., description="'L8 attn', 'L8 mlp', 'L8 H3', 'embed'.")
+    logits: float = Field(
         ...,
         description=(
-            "baseline_answer_prob_after - baseline_answer.prob. The signed change in "
-            "support for the answer the intact model gave."
+            "Signed contribution to (answer logit - contrast logit). Positive pushed "
+            "toward the answer, negative pushed away."
         ),
     )
-    kl_bits: float = Field(
+    share: float = Field(
         ...,
-        description=(
-            "KL(baseline || ablated) over the full vocabulary, in bits. The scalar "
-            "effect size — 0 means the component made no difference to this prompt."
-        ),
+        description="logits as a fraction of the total margin. Can exceed 1 when others push back.",
     )
-    top_shifts: List[TokenShift] = Field(
-        ..., description="Candidates whose probability moved most, largest magnitude first."
-    )
-
-
-class AblateRequest(Schema):
-    model_id: str
-    prompt: str = Field(..., min_length=1, max_length=2000)
-    ablations: List[Ablation] = Field(
-        ...,
-        min_length=1,
-        max_length=16,
-        description="Components to switch off. All are applied to the same forward pass.",
-    )
-    top_k: int = Field(5, ge=1, le=10)
-    position: Optional[int] = None
-    max_tokens: Optional[int] = Field(None, ge=1)
-
-
-class AblateResponse(Schema):
-    model_id: str
-    display_name: str
-    tokens: List[str]
-    position: int
-    ablations: List[Ablation] = Field(..., description="Echoed back, resolved and validated.")
-    ablation_label: str = Field(..., description="Human-readable summary, e.g. 'L7 H3'.")
-    baseline: LensTrace
-    ablated: LensTrace
-    effect: AblationEffect
-    narration: List[str]
-    truncated: bool
-    prompt_notice: Optional[str] = None
-
-
-# --------------------------------------------------------------------------
-# Attribution sweep — ablate every component of one kind, then rank them
-# --------------------------------------------------------------------------
-
-
-class ComponentEffect(Schema):
-    """One component's measured contribution, from its own ablation run."""
-
-    layer: int = Field(..., description="0-based block index; `label` carries the display name.")
-    head: Optional[int] = Field(None, description="None when the whole block was ablated.")
-    label: str = Field(..., description="'L8' for block 7, 'L8 H3' for head 3 inside it.")
-    baseline_answer_prob_after: float
-    prob_delta: float
-    kl_bits: float
-    top_token: str = Field(..., description="What the ablated run predicts instead.")
-    top_token_id: int
-    answer_changed: bool
 
 
 class AttributionRequest(Schema):
     model_id: str
     prompt: str = Field(..., min_length=1, max_length=2000)
-    scope: str = Field(
-        "heads",
-        description=(
-            "'layers' ablates each block in turn (one run per block). 'heads' ablates "
-            "each head inside `layer` (one run per head)."
-        ),
-        pattern="^(layers|heads)$",
-    )
-    layer: Optional[int] = Field(
+    contrast_token_id: Optional[int] = Field(
         None,
-        ge=0,
-        description="Required when scope is 'heads'; ignored when scope is 'layers'.",
+        description=(
+            "Token to measure the answer against. Defaults to the runner-up, which "
+            "asks 'what made it pick this word over the next-best one?'"
+        ),
     )
     position: Optional[int] = None
     max_tokens: Optional[int] = Field(None, ge=1)
@@ -343,13 +206,114 @@ class AttributionResponse(Schema):
     display_name: str
     tokens: List[str]
     position: int
-    scope: str
-    layer: Optional[int] = None
-    baseline_answer: TokenPrediction
-    components: List[ComponentEffect] = Field(
-        ..., description="Ranked by kl_bits, strongest effect first."
+    answer: TokenPrediction = Field(..., description="The token the model actually predicts.")
+    contrast: TokenPrediction = Field(..., description="The token the answer is measured against.")
+    margin: float = Field(
+        ...,
+        description="answer logit - contrast logit. Every contribution below sums into this.",
     )
-    runs: int = Field(..., description="Forward passes performed, excluding the baseline.")
+    blocks: List[Contribution] = Field(
+        ...,
+        description=(
+            "Embeddings plus each block's attention and MLP. These sum to `margin` "
+            "minus `unattributed`, exactly — they are the whole network."
+        ),
+    )
+    heads: List[Contribution] = Field(
+        ...,
+        description="Every attention head, ranked by absolute contribution. A drill-down into the attn rows above.",
+    )
+    unattributed: float = Field(
+        ...,
+        description=(
+            "The bias terms, which belong to no component. Small; reported so the "
+            "arithmetic is checkable rather than hidden."
+        ),
+    )
+    narration: List[str]
+    truncated: bool
+    prompt_notice: Optional[str] = None
+
+
+# --------------------------------------------------------------------------
+# Patching — run one checkpoint with the other's weights in one place
+#
+# Ablation asks "what if this part were silent?", which is a state the model was
+# never trained for. Patching asks the question a fine-tuner actually has: if I
+# reverted this one layer to the base weights, would the behaviour come back?
+# Only possible because the two models share an architecture and a tokenizer.
+# --------------------------------------------------------------------------
+
+
+class LayerPatch(Schema):
+    """The result of reverting one part of the recipient to the donor's weights."""
+
+    layer: int = Field(
+        ...,
+        description="0-based block index; -1 for the embeddings, block count for the read-out.",
+    )
+    kind: str = Field(..., description="'embed', 'block', or 'readout'.")
+    label: str
+    answer: TokenPrediction = Field(..., description="What the recipient says with this patch in place.")
+    donor_answer_prob: float = Field(
+        ..., description="Probability the patched run assigns to the DONOR's answer."
+    )
+    recovery: Optional[float] = Field(
+        None,
+        description=(
+            "How far this single patch moved the recipient toward the donor, as a "
+            "fraction: 0 = no movement, 1 = fully the donor's answer. None when the "
+            "two models already agreed and the question is undefined."
+        ),
+    )
+    flipped: bool = Field(..., description="True if the patched answer matches the donor's.")
+
+
+class PatchFocus(Schema):
+    """Real generated text for one chosen layer, so the effect is legible as behavior."""
+
+    layer: int
+    label: str
+    recipient_text: str
+    donor_text: str
+    patched_text: str
+
+
+class PatchRequest(Schema):
+    recipient_model_id: str = Field(..., description="The model being modified — usually your fine-tune.")
+    donor_model_id: str = Field(..., description="Where the transplanted component comes from — usually the base.")
+    prompt: str = Field(..., min_length=1, max_length=2000)
+    layer: Optional[int] = Field(
+        None,
+        ge=-1,
+        description=(
+            "Omit to sweep everything. Name one to also generate real text for that "
+            "swap, which is the version you can actually read. -1 is the embeddings and "
+            "the block count is the read-out."
+        ),
+    )
+    position: Optional[int] = None
+    max_tokens: Optional[int] = Field(None, ge=1)
+    max_new_tokens: int = Field(24, ge=1, le=80)
+
+
+class PatchResponse(Schema):
+    recipient_model_id: str
+    recipient_name: str
+    donor_model_id: str
+    donor_name: str
+    tokens: List[str]
+    position: int
+    recipient_answer: TokenPrediction
+    donor_answer: TokenPrediction
+    agreed: bool = Field(
+        ..., description="True if both checkpoints already predict the same token here."
+    )
+    layers: List[LayerPatch] = Field(..., description="One entry per block, in layer order.")
+    best_layer: Optional[int] = Field(
+        None, description="The part whose swap moved the recipient furthest toward the donor."
+    )
+    focus: Optional[PatchFocus] = None
     narration: List[str]
     truncated: bool
     prompt_notice: Optional[str] = None

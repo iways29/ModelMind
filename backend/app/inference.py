@@ -16,26 +16,23 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tupl
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
 
-from .insights import narrate_ablation, narrate_attribution, narrate_behavior, narrate_lens
+from .insights import narrate_attribution, narrate_behavior, narrate_lens, narrate_patch
 from .models import ModelInfo, get_model
 from .schemas import (
-    Ablation,
-    AblateResponse,
-    AblationEffect,
     AnalyzeResponse,
     AttributionResponse,
     BehaviorResponse,
-    CompareResponse,
-    ComponentEffect,
     Continuation,
+    Contribution,
     Divergence,
     LayerLens,
+    LayerPatch,
     LensResponse,
     LensTrace,
-    ModelMagnitudes,
+    PatchFocus,
+    PatchResponse,
     PromptBehavior,
     TokenPrediction,
-    TokenShift,
     TokenTrajectory,
 )
 
@@ -71,12 +68,12 @@ class LensUnsupportedError(RuntimeError):
     """Raised when a model doesn't expose the final norm + output head the lens needs."""
 
 
-class AblationUnsupportedError(RuntimeError):
+class ComponentUnsupportedError(RuntimeError):
     """Raised when a model's block/attention layout isn't one we know how to switch off."""
 
 
-class InvalidAblationError(ValueError):
-    """Raised when an ablation names a layer or head this model doesn't have."""
+class PatchIncompatibleError(ValueError):
+    """Raised when two checkpoints are too different to transplant between."""
 
 
 @dataclass(frozen=True)
@@ -225,7 +222,7 @@ class _Prepared:
 
 
 def _prepare(loaded: LoadedModel, prompt: str, max_tokens: Optional[int]) -> _Prepared:
-    """Tokenize once. Ablation sweeps re-run the model dozens of times on this."""
+    """Tokenize once. Patch sweeps re-run the model once per block on this."""
     budget = _resolve_token_budget(max_tokens)
 
     prompt, notice = _clean_prompt(prompt)
@@ -245,18 +242,13 @@ def _prepare(loaded: LoadedModel, prompt: str, max_tokens: Optional[int]) -> _Pr
     )
 
 
-def _run(
-    loaded: LoadedModel,
-    input_ids: torch.Tensor,
-    ablations: Sequence[Ablation] = (),
-    internals: bool = True,
-) -> Any:
-    """One CPU forward pass, optionally with components switched off.
+def _run(loaded: LoadedModel, input_ids: torch.Tensor, internals: bool = True) -> Any:
+    """One CPU forward pass.
 
     `internals=False` skips attention and hidden-state collection, which is most
     of the cost when all a caller wants is the final logits — the sweep case.
     """
-    with torch.no_grad(), _ablated(loaded, ablations):
+    with torch.no_grad():
         return loaded.model(
             input_ids=input_ids,
             attention_mask=torch.ones_like(input_ids),
@@ -276,17 +268,7 @@ def _forward(
 
 
 # --------------------------------------------------------------------------
-# Ablation hooks
-#
-# Two different surgeries, because "switch this off" means two different things
-# at the two granularities:
-#
-#   whole block — replace the block's output with its own input, so the residual
-#                 stream flows past untouched. Attention and MLP both contribute
-#                 nothing; the model runs as if the layer were not there.
-#   single head — zero that head's slice of the concatenated attention output
-#                 *before* the output projection mixes the heads together. After
-#                 c_proj the heads are summed and can no longer be separated.
+# Locating the pieces of a block
 # --------------------------------------------------------------------------
 
 
@@ -297,91 +279,11 @@ def _blocks(model: PreTrainedModel) -> Any:
     if blocks is None and base is not None:
         blocks = getattr(base, "layers", None)
     if blocks is None:
-        raise AblationUnsupportedError(
+        raise ComponentUnsupportedError(
             f"{model.__class__.__name__} does not expose an indexable list of transformer "
             "blocks, so its components can't be switched off."
         )
     return blocks
-
-
-def _skip_block_hook(module: Any, args: Any, kwargs: Any, output: Any) -> Any:
-    """Return the block's input in place of its output."""
-    resid = args[0] if args else kwargs.get("hidden_states")
-    if resid is None:
-        return output
-    # GPT2Block returns (hidden_states,) plus attention weights when they were
-    # requested. Keep the tail so `output_attentions=True` still works.
-    if isinstance(output, tuple):
-        return (resid,) + tuple(output[1:])
-    return resid
-
-
-def _zero_head_hook(head: int, head_dim: int) -> Any:
-    """Pre-hook for `attn.c_proj` that blanks one head's contribution."""
-
-    def hook(module: Any, args: Any) -> Any:
-        merged = args[0]
-        # Clone: the incoming tensor is the attention output, and writing into it
-        # in place would corrupt autograd bookkeeping and any shared storage.
-        patched = merged.clone()
-        patched[..., head * head_dim : (head + 1) * head_dim] = 0.0
-        return (patched,) + tuple(args[1:])
-
-    return hook
-
-
-def _validate_ablations(loaded: LoadedModel, ablations: Iterable[Ablation]) -> List[Ablation]:
-    resolved = list(ablations)
-    for ablation in resolved:
-        if ablation.layer >= loaded.num_layers:
-            raise InvalidAblationError(
-                f"{loaded.info.display_name} has {loaded.num_layers} blocks (0-"
-                f"{loaded.num_layers - 1}); layer {ablation.layer} doesn't exist."
-            )
-        if ablation.head is not None and ablation.head >= loaded.num_heads:
-            raise InvalidAblationError(
-                f"{loaded.info.display_name} has {loaded.num_heads} heads per block (0-"
-                f"{loaded.num_heads - 1}); head {ablation.head} doesn't exist."
-            )
-    return resolved
-
-
-@contextmanager
-def _ablated(loaded: LoadedModel, ablations: Sequence[Ablation]) -> Iterator[None]:
-    """Install ablation hooks for the duration of the block, then always remove them.
-
-    The model is a process-wide cached singleton, so a hook that outlives its
-    request would silently corrupt every later run. Hence the unconditional
-    teardown in `finally`.
-    """
-    if not ablations:
-        yield
-        return
-
-    blocks = _blocks(loaded.model)
-    head_dim = int(loaded.model.config.hidden_size) // loaded.num_heads
-    handles: List[Any] = []
-    try:
-        for ablation in ablations:
-            block = blocks[ablation.layer]
-            if ablation.head is None:
-                handles.append(block.register_forward_hook(_skip_block_hook, with_kwargs=True))
-                continue
-
-            attn = getattr(block, "attn", None) or getattr(block, "self_attn", None)
-            projection = getattr(attn, "c_proj", None) or getattr(attn, "o_proj", None)
-            if projection is None:
-                raise AblationUnsupportedError(
-                    f"Block {ablation.layer} has no attention output projection to hook, "
-                    "so individual heads can't be isolated."
-                )
-            handles.append(
-                projection.register_forward_pre_hook(_zero_head_hook(ablation.head, head_dim))
-            )
-        yield
-    finally:
-        for handle in handles:
-            handle.remove()
 
 
 def _attentions_to_nested(outputs: Any) -> List[List[List[List[float]]]]:
@@ -394,19 +296,6 @@ def _attentions_to_nested(outputs: Any) -> List[List[List[List[float]]]]:
     return nested
 
 
-def _hidden_state_magnitudes(outputs: Any) -> List[float]:
-    """Mean absolute activation for each hidden state.
-
-    `hidden_states` has `num_layers + 1` entries: index 0 is the embedding
-    output, index i>0 is the output of transformer block i.
-
-    Note the last entry is taken *after* GPT-2's final layer norm (`ln_f`), so
-    it drops sharply rather than continuing the ramp. That's the architecture,
-    not a bug — the UI says so too.
-    """
-    return [round(float(h[0].abs().mean().item()), 6) for h in outputs.hidden_states]
-
-
 def analyze(model_id: str, prompt: str, max_tokens: Optional[int] = None) -> AnalyzeResponse:
     """Run one model on one prompt and extract tokens, attention, activations."""
     loaded = load_model(model_id)
@@ -416,60 +305,9 @@ def analyze(model_id: str, prompt: str, max_tokens: Optional[int] = None) -> Ana
         model_id=loaded.info.id,
         tokens=tokens,
         attentions=_attentions_to_nested(outputs),
-        hidden_state_magnitudes=_hidden_state_magnitudes(outputs),
         num_layers=loaded.num_layers,
         num_heads=loaded.num_heads,
         truncated=truncated,
-        prompt_notice=notice,
-    )
-
-
-def compare(
-    base_model_id: str,
-    finetuned_model_id: str,
-    prompt: str,
-    max_tokens: Optional[int] = None,
-) -> CompareResponse:
-    """Run two models on the same prompt and diff their per-layer activations."""
-    base = load_model(base_model_id)
-    finetuned = load_model(finetuned_model_id)
-
-    base_tokens, base_out, _, notice = _forward(base, prompt, max_tokens)
-    ft_tokens, ft_out, _, _ = _forward(finetuned, prompt, max_tokens)
-
-    base_mags = _hidden_state_magnitudes(base_out)
-    ft_mags = _hidden_state_magnitudes(ft_out)
-
-    # Models of different depth (e.g. gpt2 vs gpt2-medium) still line up at the
-    # embedding and early blocks, so diff the shared prefix rather than refusing.
-    shared = min(len(base_mags), len(ft_mags))
-    delta = [round(ft_mags[i] - base_mags[i], 6) for i in range(shared)]
-
-    notes: List[str] = []
-    if len(base_mags) != len(ft_mags):
-        notes.append(
-            f"Different depths ({len(base_mags) - 1} vs {len(ft_mags) - 1} blocks); "
-            f"delta covers the first {shared} hidden states only."
-        )
-    if base_tokens != ft_tokens:
-        notes.append("The two tokenizers disagree on this prompt; token labels come from the base model.")
-
-    return CompareResponse(
-        prompt=prompt,
-        tokens=base_tokens,
-        base=ModelMagnitudes(
-            model_id=base.info.id,
-            display_name=base.info.display_name,
-            hidden_state_magnitudes=base_mags,
-        ),
-        finetuned=ModelMagnitudes(
-            model_id=finetuned.info.id,
-            display_name=finetuned.info.display_name,
-            hidden_state_magnitudes=ft_mags,
-        ),
-        delta=delta,
-        layers_compared=shared,
-        note=" ".join(notes) if notes else None,
         prompt_notice=notice,
     )
 
@@ -646,47 +484,15 @@ def logit_lens(
 
 
 # --------------------------------------------------------------------------
-# Ablation
+# Naming blocks
 # --------------------------------------------------------------------------
-
-
-def _kl_bits(reference: torch.Tensor, other: torch.Tensor) -> float:
-    """KL(reference || other) in bits — how much the ablated run surprises the baseline.
-
-    Asymmetric on purpose: it weights the tokens the *intact* model cared about,
-    which is the question being asked ("what did removing this cost the answer?").
-    """
-    p = reference.clamp_min(1e-12)
-    q = other.clamp_min(1e-12)
-    return float((p * (p.log2() - q.log2())).sum().item())
-
-
-def _top_shifts(
-    loaded: LoadedModel, baseline: torch.Tensor, ablated: torch.Tensor, limit: int = 6
-) -> List[TokenShift]:
-    """The candidates whose probability moved most, in either direction."""
-    delta = ablated - baseline
-    moved = torch.topk(delta.abs(), limit).indices
-
-    shifts = [
-        TokenShift(
-            token=_display_token(loaded.tokenizer, int(tid)),
-            token_id=int(tid),
-            baseline_prob=round(float(baseline[tid].item()), 6),
-            ablated_prob=round(float(ablated[tid].item()), 6),
-            delta=round(float(delta[tid].item()), 6),
-        )
-        for tid in moved
-    ]
-    shifts.sort(key=lambda s: abs(s.delta), reverse=True)
-    return shifts
 
 
 def _block_label(layer: int) -> str:
     """Name a block the way the lens names its output.
 
     The lens labels hidden states, where "L5" is the residual stream *after*
-    block 4. Numbering blocks 0-based in the UI too would mean ablating "L4" and
+    block 4. Numbering blocks 0-based in the UI too would mean patching "L4" and
     watching the trace change at "L5", which reads as an off-by-one bug. So the
     wire keeps the honest 0-based block index and the label is shifted to match
     the row the block writes.
@@ -694,149 +500,525 @@ def _block_label(layer: int) -> str:
     return f"L{layer + 1}"
 
 
-def _ablation_label(ablations: Sequence[Ablation]) -> str:
-    parts = [
-        _block_label(a.layer) if a.head is None else f"{_block_label(a.layer)} H{a.head}"
-        for a in ablations
-    ]
-    return " + ".join(parts)
-
-
 def _final_probs(outputs: Any, pos: int) -> torch.Tensor:
     """Softmax over the model's own output logits at one position."""
     return torch.softmax(outputs.logits[0, pos].float(), dim=-1)
 
 
-def ablate(
-    model_id: str,
-    prompt: str,
-    ablations: Sequence[Ablation],
-    top_k: int = 5,
-    position: Optional[int] = None,
-    max_tokens: Optional[int] = None,
-) -> AblateResponse:
-    """Run the model twice — intact, then with components switched off — and diff.
+# --------------------------------------------------------------------------
+# Attribution — splitting the answer into one number per component
+#
+# The residual stream is a running sum: every block *adds* to it and nothing is
+# overwritten. The read-out at the end is a layer norm followed by a linear map.
+# So if the layer norm's scale is held fixed, the answer's logit is a plain
+# linear function of that sum, and it splits exactly into one term per
+# component — embeddings, and each block's attention and MLP.
+#
+# That is the whole trick, and it is why this needs one forward pass rather than
+# one per component. Switching a part off and re-running measures something
+# related but different (it also captures how the parts downstream react); this
+# measures the direct push, exactly, and the terms are checkable because they
+# must add back up to the number they came from.
+# --------------------------------------------------------------------------
 
-    This is the counterfactual the rest of the tool can only hint at: the lens
-    shows *when* an answer formed, and this shows *what the answer depended on*.
+
+@dataclass(frozen=True)
+class _Decomposition:
+    """Every component's write into the residual stream, at one token position."""
+
+    embed: torch.Tensor  # (d_model,)
+    attn: List[torch.Tensor]  # per block, (d_model,)
+    mlp: List[torch.Tensor]  # per block, (d_model,)
+    heads: List[Optional[torch.Tensor]]  # per block, (n_heads, d_model)
+    final_resid: torch.Tensor  # (d_model,) — the sum, before the final norm
+    logits: torch.Tensor  # (vocab,)
+
+
+def _block_parts(block: Any, layer: int) -> Tuple[Any, Any]:
+    """The attention and MLP sub-modules, whatever this architecture calls them."""
+    attn = getattr(block, "attn", None) or getattr(block, "self_attn", None)
+    mlp = getattr(block, "mlp", None) or getattr(block, "feed_forward", None)
+    if attn is None or mlp is None:
+        raise ComponentUnsupportedError(
+            f"Block {layer} does not expose separate attention and MLP sub-modules, "
+            "so its contribution can't be split."
+        )
+    return attn, mlp
+
+
+def _head_contributions(projection: Any, merged: torch.Tensor, n_heads: int) -> Optional[torch.Tensor]:
+    """Split one block's attention output into per-head writes.
+
+    After the output projection the heads are summed and can never be separated
+    again, so the split has to happen on its *input*: each head owns a disjoint
+    slice of that vector, and therefore a disjoint band of rows in the projection
+    matrix. Multiplying one head's slice by its own band gives exactly what that
+    head contributed.
+
+    Returns None when the projection isn't a shape we can decompose, so head
+    attribution degrades to "unavailable" rather than to a wrong number.
     """
-    loaded = load_model(model_id)
-    resolved = _validate_ablations(loaded, ablations)
+    weight = getattr(projection, "weight", None)
+    if weight is None:
+        return None
 
-    prepared = _prepare(loaded, prompt, max_tokens)
-    pos = _resolve_position(prepared.tokens, position)
+    d_model = merged.shape[-1]
+    head_dim = d_model // n_heads
 
-    baseline_trace, baseline_probs = _lens_trace(
-        loaded, _run(loaded, prepared.input_ids), pos, top_k
-    )
-    ablated_trace, ablated_probs = _lens_trace(
-        loaded, _run(loaded, prepared.input_ids, resolved), pos, top_k
-    )
+    # GPT-2's Conv1D stores (in, out) and computes x @ W; nn.Linear stores
+    # (out, in) and computes x @ W.T. Tell them apart by which axis is the input.
+    if weight.shape[0] == d_model:
+        rows = lambda lo, hi: weight[lo:hi, :]  # noqa: E731 — Conv1D
+    elif weight.shape[1] == d_model:
+        rows = lambda lo, hi: weight[:, lo:hi].T  # noqa: E731 — nn.Linear
+    else:
+        return None
 
-    baseline_answer = baseline_trace.final_prediction
-    after = float(ablated_probs[baseline_answer.token_id].item())
-
-    effect = AblationEffect(
-        answer_changed=ablated_trace.final_prediction.token_id != baseline_answer.token_id,
-        baseline_answer=baseline_answer,
-        ablated_answer=ablated_trace.final_prediction,
-        baseline_answer_prob_after=round(after, 6),
-        prob_delta=round(after - baseline_answer.prob, 6),
-        kl_bits=round(_kl_bits(baseline_probs, ablated_probs), 4),
-        top_shifts=_top_shifts(loaded, baseline_probs, ablated_probs),
+    return torch.stack(
+        [
+            merged[h * head_dim : (h + 1) * head_dim].float()
+            @ rows(h * head_dim, (h + 1) * head_dim).float()
+            for h in range(n_heads)
+        ]
     )
 
-    label = _ablation_label(resolved)
-    return AblateResponse(
-        model_id=loaded.info.id,
-        display_name=loaded.info.display_name,
-        tokens=prepared.tokens,
-        position=pos,
-        ablations=resolved,
-        ablation_label=label,
-        baseline=baseline_trace,
-        ablated=ablated_trace,
-        effect=effect,
-        narration=narrate_ablation(label, effect, baseline_trace, ablated_trace),
-        truncated=prepared.truncated,
-        prompt_notice=prepared.notice,
+
+def _decompose(loaded: LoadedModel, input_ids: torch.Tensor, pos: int) -> _Decomposition:
+    """Capture what every component wrote into the residual stream, in one pass."""
+    model = loaded.model
+    blocks = _blocks(model)
+    norm, _ = _output_projection(model)
+    n_heads = loaded.num_heads
+
+    attn_out: Dict[int, torch.Tensor] = {}
+    mlp_out: Dict[int, torch.Tensor] = {}
+    head_out: Dict[int, Optional[torch.Tensor]] = {}
+    resid: Dict[str, torch.Tensor] = {}
+    handles: List[Any] = []
+
+    def written(output: Any) -> torch.Tensor:
+        """Attention returns a tuple; the MLP returns a bare tensor."""
+        tensor = output[0] if isinstance(output, tuple) else output
+        return tensor[0, pos].detach()
+
+    try:
+        for index, block in enumerate(blocks):
+            attn, mlp = _block_parts(block, index)
+            handles.append(
+                attn.register_forward_hook(
+                    lambda _m, _a, out, i=index: attn_out.__setitem__(i, written(out))
+                )
+            )
+            handles.append(
+                mlp.register_forward_hook(
+                    lambda _m, _a, out, i=index: mlp_out.__setitem__(i, written(out))
+                )
+            )
+            projection = getattr(attn, "c_proj", None) or getattr(attn, "o_proj", None)
+            if projection is not None:
+                handles.append(
+                    projection.register_forward_pre_hook(
+                        lambda _m, args, i=index, proj=projection: head_out.__setitem__(
+                            i, _head_contributions(proj, args[0][0, pos].detach(), n_heads)
+                        )
+                    )
+                )
+
+        # The final norm's *input* is the completed sum. It isn't in
+        # `hidden_states` — that list's last entry is already normed.
+        handles.append(
+            norm.register_forward_pre_hook(lambda _m, args: resid.__setitem__("x", args[0][0, pos].detach()))
+        )
+
+        with torch.no_grad():
+            outputs = model(
+                input_ids=input_ids,
+                attention_mask=torch.ones_like(input_ids),
+                output_hidden_states=True,
+                use_cache=False,
+            )
+    finally:
+        # The model is a process-wide singleton; a hook that outlived its request
+        # would silently corrupt every later run.
+        for handle in handles:
+            handle.remove()
+
+    layer_count = len(blocks)
+    return _Decomposition(
+        embed=outputs.hidden_states[0][0, pos].detach(),
+        attn=[attn_out[i] for i in range(layer_count)],
+        mlp=[mlp_out[i] for i in range(layer_count)],
+        heads=[head_out.get(i) for i in range(layer_count)],
+        final_resid=resid["x"],
+        logits=outputs.logits[0, pos].detach(),
     )
 
 
 def attribution(
     model_id: str,
     prompt: str,
-    scope: str = "heads",
-    layer: Optional[int] = None,
+    contrast_token_id: Optional[int] = None,
     position: Optional[int] = None,
     max_tokens: Optional[int] = None,
 ) -> AttributionResponse:
-    """Ablate every component of one kind in turn and rank them by effect.
+    """Split the answer's margin over the runner-up into one number per component.
 
-    One ablation at a time answers "did this matter?"; only a sweep answers
-    "which one mattered most?", and a 12-head block is far too many to try by
-    hand. Each run needs only the final logits, so `internals=False` keeps the
-    sweep to roughly one baseline forward pass per component.
+    Measured as a *difference* between two tokens rather than one token's raw
+    logit, because a raw logit means nothing on its own — adding a constant to
+    every logit leaves the model's answer unchanged. The difference is what the
+    model actually decided, so it's what's worth attributing.
     """
     loaded = load_model(model_id)
-
-    if scope == "heads":
-        if layer is None:
-            raise InvalidAblationError("scope='heads' needs a layer to sweep.")
-        targets = [Ablation(layer=layer, head=h) for h in range(loaded.num_heads)]
-    else:
-        targets = [Ablation(layer=index) for index in range(loaded.num_layers)]
-    _validate_ablations(loaded, targets)
+    norm, head = _output_projection(loaded.model)
 
     prepared = _prepare(loaded, prompt, max_tokens)
     pos = _resolve_position(prepared.tokens, position)
+    decomposed = _decompose(loaded, prepared.input_ids, pos)
 
-    baseline_probs = _final_probs(_run(loaded, prepared.input_ids, internals=False), pos)
-    baseline_id = int(torch.argmax(baseline_probs).item())
-    baseline_answer = TokenPrediction(
-        token=_display_token(loaded.tokenizer, baseline_id),
-        token_id=baseline_id,
-        prob=round(float(baseline_probs[baseline_id].item()), 6),
+    logits = decomposed.logits.float()
+    probs = torch.softmax(logits, dim=-1)
+    ranked = torch.topk(logits, 2).indices
+    answer_id = int(ranked[0].item())
+    contrast_id = int(ranked[1].item()) if contrast_token_id is None else int(contrast_token_id)
+
+    def prediction(token_id: int) -> TokenPrediction:
+        return TokenPrediction(
+            token=_display_token(loaded.tokenizer, token_id),
+            token_id=token_id,
+            prob=round(float(probs[token_id].item()), 6),
+        )
+
+    # The direction in activation space that separates these two tokens, folded
+    # through the final norm's fixed scale so component writes map straight onto
+    # logit difference.
+    resid = decomposed.final_resid.float()
+    scale = torch.sqrt(resid.var(unbiased=False) + float(getattr(norm, "eps", 1e-5)))
+    weights = head.weight.float()
+    direction = (weights[answer_id] - weights[contrast_id]) * norm.weight.float() / scale
+
+    def push(vector: torch.Tensor) -> float:
+        centred = vector.float()
+        return float(((centred - centred.mean()) @ direction).item())
+
+    margin = float((logits[answer_id] - logits[contrast_id]).item())
+
+    blocks: List[Contribution] = [
+        _contribution("embed", None, None, "embed", push(decomposed.embed), margin)
+    ]
+    for index in range(loaded.num_layers):
+        label = _block_label(index)
+        blocks.append(
+            _contribution("attn", index, None, f"{label} attn", push(decomposed.attn[index]), margin)
+        )
+        blocks.append(
+            _contribution("mlp", index, None, f"{label} mlp", push(decomposed.mlp[index]), margin)
+        )
+
+    heads: List[Contribution] = []
+    for index, per_head in enumerate(decomposed.heads):
+        if per_head is None:
+            continue
+        label = _block_label(index)
+        heads.extend(
+            _contribution("head", index, h, f"{label} H{h}", push(per_head[h]), margin)
+            for h in range(per_head.shape[0])
+        )
+    heads.sort(key=lambda c: abs(c.logits), reverse=True)
+
+    # The norm's shift term belongs to no component. Reporting it keeps the sum
+    # honest and lets anyone check the arithmetic.
+    bias = getattr(norm, "bias", None)
+    unattributed = (
+        float(((weights[answer_id] - weights[contrast_id]) @ bias.float()).item())
+        if bias is not None
+        else 0.0
     )
-
-    components: List[ComponentEffect] = []
-    for target in targets:
-        probs = _final_probs(
-            _run(loaded, prepared.input_ids, [target], internals=False), pos
-        )
-        top_id = int(torch.argmax(probs).item())
-        after = float(probs[baseline_id].item())
-        components.append(
-            ComponentEffect(
-                layer=target.layer,
-                head=target.head,
-                label=_ablation_label([target]),
-                baseline_answer_prob_after=round(after, 6),
-                prob_delta=round(after - baseline_answer.prob, 6),
-                kl_bits=round(_kl_bits(baseline_probs, probs), 4),
-                top_token=_display_token(loaded.tokenizer, top_id),
-                top_token_id=top_id,
-                answer_changed=top_id != baseline_id,
-            )
-        )
-
-    components.sort(key=lambda c: c.kl_bits, reverse=True)
 
     return AttributionResponse(
         model_id=loaded.info.id,
         display_name=loaded.info.display_name,
         tokens=prepared.tokens,
         position=pos,
-        scope=scope,
-        layer=layer if scope == "heads" else None,
-        baseline_answer=baseline_answer,
-        components=components,
-        runs=len(targets),
-        narration=narrate_attribution(
-            scope,
-            components,
-            baseline_answer,
-            _block_label(layer) if scope == "heads" and layer is not None else None,
+        answer=prediction(answer_id),
+        contrast=prediction(contrast_id),
+        margin=round(margin, 4),
+        blocks=blocks,
+        heads=heads,
+        unattributed=round(unattributed, 4),
+        narration=narrate_attribution(blocks, heads, prediction(answer_id), prediction(contrast_id), margin),
+        truncated=prepared.truncated,
+        prompt_notice=prepared.notice,
+    )
+
+
+def _contribution(
+    kind: str, layer: Optional[int], head: Optional[int], label: str, value: float, margin: float
+) -> Contribution:
+    return Contribution(
+        kind=kind,
+        layer=layer,
+        head=head,
+        label=label,
+        logits=round(value, 4),
+        share=round(value / margin, 4) if abs(margin) > 1e-9 else 0.0,
+    )
+
+
+# --------------------------------------------------------------------------
+# Patching — running one checkpoint with another's component spliced in
+#
+# The question a fine-tuner actually has is "which part of my model changed?",
+# and neither of the obvious approaches answers it. Comparing weights tells you
+# where the numbers moved, not where the *behaviour* moved. Switching a part off
+# tells you what breaks without it, which is not the same as what the fine-tune
+# did to it.
+#
+# Splicing does answer it. Take one block's output from the base model, drop it
+# into the fine-tune in place of its own, and let the rest of the fine-tune run
+# normally. If the fine-tuned behaviour disappears, that block was carrying it.
+# --------------------------------------------------------------------------
+
+
+def _require_swappable(donor: LoadedModel, recipient: LoadedModel, prompt_ids: Sequence[int]) -> None:
+    """Refuse pairings where one model's weights would mean nothing in the other.
+
+    Same depth and width is the mechanical requirement. Identical tokenization is
+    the semantic one: if the two models cut the prompt into different pieces,
+    they aren't reading the same sentence and no comparison between them holds.
+    """
+    if donor.num_layers != recipient.num_layers:
+        raise PatchIncompatibleError(
+            f"{donor.info.display_name} has {donor.num_layers} blocks and "
+            f"{recipient.info.display_name} has {recipient.num_layers}. Swapping needs matching "
+            "depth — pick two checkpoints of the same size."
+        )
+    donor_width = int(donor.model.config.hidden_size)
+    recipient_width = int(recipient.model.config.hidden_size)
+    if donor_width != recipient_width:
+        raise PatchIncompatibleError(
+            f"Residual streams are different widths ({donor_width} vs {recipient_width}), "
+            "so one model's blocks don't fit in the other."
+        )
+    if donor.tokenizer.encode(donor.tokenizer.decode(list(prompt_ids))) != list(prompt_ids):
+        raise PatchIncompatibleError(
+            f"{donor.info.display_name} tokenizes this prompt differently from "
+            f"{recipient.info.display_name}, so their positions don't line up."
+        )
+
+
+def _readout(model: PreTrainedModel) -> Tuple[Any, str]:
+    """The module holding the final norm, and the attribute name it lives under."""
+    base = getattr(model, "transformer", None) or getattr(model, "model", None)
+    if base is not None:
+        for attr in ("ln_f", "norm", "final_layer_norm", "final_norm"):
+            if getattr(base, attr, None) is not None:
+                return base, attr
+    raise ComponentUnsupportedError(
+        f"{model.__class__.__name__} does not expose a final norm, so its read-out "
+        "can't be swapped."
+    )
+
+
+# The two ends of the network, which are weights too and change under
+# fine-tuning like any block does. Sweeping only the blocks would be a quiet
+# lie: a fine-tune that moved its output embedding shows nothing anywhere in a
+# block sweep, and "the change isn't in the blocks" reads identically to "there
+# is no change to find". Numbered outside the block range so one integer can
+# address any part of the model.
+EMBED_TARGET = -1
+
+
+def _readout_target(loaded: LoadedModel) -> int:
+    return loaded.num_layers
+
+
+@contextmanager
+def _reverted(recipient: LoadedModel, donor: LoadedModel, target: int) -> Iterator[None]:
+    """Run the recipient with the donor's weights in exactly one place.
+
+    This is a *weight* swap, not an activation transplant, and the difference is
+    the whole point. Transplanting activations replaces the residual stream at
+    that depth, which carries everything the earlier blocks did too — so it
+    measures the accumulated difference up to that point, not the part. Swapping
+    weights leaves the stream alone and changes only what this part does to it,
+    which is the question a fine-tuner actually has: if I reverted this layer,
+    would the behaviour come back?
+
+    Swapping every target at once reproduces the donor exactly, which is the
+    property that makes the sweep trustworthy — nothing is left unaccounted for.
+    """
+    restore: List[Any] = []
+    try:
+        if target == EMBED_TARGET:
+            r_base = recipient.model.transformer
+            d_base = donor.model.transformer
+            # Only the input side moves here. `lm_head` holds its own reference
+            # to the recipient's original embedding tensor, so the output side
+            # stays put and remains the read-out's business.
+            for attr in ("wte", "wpe"):
+                restore.append((r_base, attr, getattr(r_base, attr)))
+                setattr(r_base, attr, getattr(d_base, attr))
+        elif target == _readout_target(recipient):
+            r_base, attr = _readout(recipient.model)
+            d_base, _ = _readout(donor.model)
+            restore.append((r_base, attr, getattr(r_base, attr)))
+            setattr(r_base, attr, getattr(d_base, attr))
+            restore.append((recipient.model, "lm_head", recipient.model.lm_head))
+            recipient.model.lm_head = donor.model.lm_head
+        else:
+            blocks = _blocks(recipient.model)
+            restore.append((blocks, target, blocks[target]))
+            blocks[target] = _blocks(donor.model)[target]
+        yield
+    finally:
+        # The models are process-wide singletons. A swap that outlived its
+        # request would quietly turn one checkpoint into a chimera of the two.
+        for holder, key, original in restore:
+            if isinstance(key, int):
+                holder[key] = original
+            else:
+                setattr(holder, key, original)
+
+
+def _target_kind(target: int, readout: int) -> str:
+    if target == EMBED_TARGET:
+        return "embed"
+    return "readout" if target == readout else "block"
+
+
+def _target_label(target: int, readout: int) -> str:
+    if target == EMBED_TARGET:
+        return "embeddings"
+    return "read-out" if target == readout else _block_label(target)
+
+
+def _generate_text(loaded: LoadedModel, ids: Sequence[int], max_new_tokens: int) -> str:
+    """Greedy continuation for one prompt, decoded to a plain string."""
+    continuation = _generate_batch(loaded, [list(ids)], max_new_tokens)[0]
+    return loaded.tokenizer.decode(continuation).strip()
+
+
+def patch(
+    recipient_model_id: str,
+    donor_model_id: str,
+    prompt: str,
+    layer: Optional[int] = None,
+    position: Optional[int] = None,
+    max_tokens: Optional[int] = None,
+    max_new_tokens: int = 24,
+) -> PatchResponse:
+    """Revert each of the recipient's blocks to the donor's weights in turn, and measure.
+
+    The sweep is one forward pass per block, so the whole thing costs about as
+    much as a dozen predictions. Naming a layer additionally generates real text
+    for that swap, which is the version worth reading — a changed token is
+    evidence, but a changed sentence is the thing you actually care about.
+
+    The read-out is swept alongside the blocks. Leaving it out would be a quiet
+    lie: a fine-tune that moved its output embedding would show nothing anywhere
+    in the block sweep, and the honest reading of that — "the change isn't in the
+    blocks" — is indistinguishable from "there's no change to find".
+    """
+    recipient = load_model(recipient_model_id)
+    donor = load_model(donor_model_id)
+
+    prepared = _prepare(recipient, prompt, max_tokens)
+    prompt_ids = prepared.input_ids[0].tolist()
+    _require_swappable(donor, recipient, prompt_ids)
+
+    pos = _resolve_position(prepared.tokens, position)
+    if layer is not None and not EMBED_TARGET <= layer <= recipient.num_layers:
+        raise PatchIncompatibleError(
+            f"{recipient.info.display_name} has {recipient.num_layers} blocks (0-"
+            f"{recipient.num_layers - 1}), the embeddings at {EMBED_TARGET}, and the read-out "
+            f"at {recipient.num_layers}; target {layer} doesn't exist."
+        )
+
+    recipient_probs = _final_probs(_run(recipient, prepared.input_ids, internals=False), pos)
+    donor_probs = _final_probs(_run(donor, prepared.input_ids, internals=False), pos)
+
+    def prediction(probs: torch.Tensor, token_id: Optional[int] = None) -> TokenPrediction:
+        tid = int(torch.argmax(probs).item()) if token_id is None else token_id
+        return TokenPrediction(
+            token=_display_token(recipient.tokenizer, tid),
+            token_id=tid,
+            prob=round(float(probs[tid].item()), 6),
+        )
+
+    recipient_answer = prediction(recipient_probs)
+    donor_answer = prediction(donor_probs)
+    agreed = recipient_answer.token_id == donor_answer.token_id
+
+    # How far a swap moved the recipient toward the donor, as a fraction of the
+    # distance between them. Scaling by that gap rather than reporting a raw
+    # probability keeps the number comparable across prompts where the two models
+    # started close together and prompts where they started far apart.
+    start = float(recipient_probs[donor_answer.token_id].item())
+    target = float(donor_probs[donor_answer.token_id].item())
+    span = target - start
+
+    # In the order the model runs: what it reads the words as, then each block,
+    # then how it turns the result back into a word.
+    readout = _readout_target(recipient)
+    targets = [EMBED_TARGET, *range(recipient.num_layers), readout]
+
+    patches: List[LayerPatch] = []
+    for target in targets:
+        with _reverted(recipient, donor, target):
+            probs = _final_probs(_run(recipient, prepared.input_ids, internals=False), pos)
+        moved = float(probs[donor_answer.token_id].item())
+        answer = prediction(probs)
+        patches.append(
+            LayerPatch(
+                layer=target,
+                kind=_target_kind(target, readout),
+                label=_target_label(target, readout),
+                answer=answer,
+                donor_answer_prob=round(moved, 6),
+                # Undefined when the two models already agree: there is no gap to
+                # close, and dividing by it would manufacture a huge number from
+                # rounding noise.
+                recovery=None if agreed or abs(span) < 1e-6 else round((moved - start) / span, 4),
+                flipped=answer.token_id == donor_answer.token_id,
+            )
+        )
+
+    scored = [p for p in patches if p.recovery is not None]
+    best = max(scored, key=lambda p: p.recovery or 0.0) if scored else None
+
+    focus: Optional[PatchFocus] = None
+    if layer is not None:
+        with _reverted(recipient, donor, layer):
+            patched_text = _generate_text(recipient, prompt_ids, max_new_tokens)
+        focus = PatchFocus(
+            layer=layer,
+            label=_target_label(layer, readout),
+            recipient_text=_generate_text(recipient, prompt_ids, max_new_tokens),
+            donor_text=_generate_text(donor, prompt_ids, max_new_tokens),
+            patched_text=patched_text,
+        )
+
+    return PatchResponse(
+        recipient_model_id=recipient.info.id,
+        recipient_name=recipient.info.display_name,
+        donor_model_id=donor.info.id,
+        donor_name=donor.info.display_name,
+        tokens=prepared.tokens,
+        position=pos,
+        recipient_answer=recipient_answer,
+        donor_answer=donor_answer,
+        agreed=agreed,
+        layers=patches,
+        best_layer=best.layer if best else None,
+        focus=focus,
+        narration=narrate_patch(
+            recipient.info.display_name,
+            donor.info.display_name,
+            recipient_answer,
+            donor_answer,
+            agreed,
+            patches,
+            focus,
         ),
         truncated=prepared.truncated,
         prompt_notice=prepared.notice,

@@ -28,16 +28,11 @@ export interface AnalyzeRequest {
  *
  * `attentions` is indexed layer -> head -> query token -> key token. GPT-2 is
  * causal, so every cell above the diagonal is 0.
- *
- * `hidden_state_magnitudes` has `num_layers + 1` entries: index 0 is the
- * embedding output, index i>0 is the output of transformer block i. The last
- * entry is measured after GPT-2's final layer norm, so it dips.
  */
 export interface AnalyzeResponse {
   model_id: string
   tokens: string[]
   attentions: number[][][][]
-  hidden_state_magnitudes: number[]
   num_layers: number
   num_heads: number
   truncated: boolean
@@ -105,107 +100,96 @@ export interface LensResponse {
  * shows as "L5", matching the lens. Never render `layer` raw; use the `label`
  * the backend sends back.
  */
-export interface Ablation {
-  layer: number
-  /** Omit or null to ablate the whole block. */
-  head?: number | null
-}
-
-/** Mirrors `LensTrace` — the layer readout of one forward pass. */
-export interface LensTrace {
-  layers: LayerLens[]
-  trajectories: TokenTrajectory[]
-  final_prediction: TokenPrediction
-}
-
-/** Mirrors `TokenShift`. */
-export interface TokenShift {
-  token: string
-  token_id: number
-  baseline_prob: number
-  ablated_prob: number
-  /** ablated_prob - baseline_prob. Negative means the ablation suppressed it. */
-  delta: number
-}
-
-/** Mirrors `AblationEffect`. */
-export interface AblationEffect {
-  answer_changed: boolean
-  baseline_answer: TokenPrediction
-  ablated_answer: TokenPrediction
-  baseline_answer_prob_after: number
-  prob_delta: number
-  /** KL(baseline || ablated) in bits — 0 means the component changed nothing. */
-  kl_bits: number
-  top_shifts: TokenShift[]
-}
-
-/** Mirrors `AblateRequest`. */
-export interface AblateRequest {
-  model_id: string
-  prompt: string
-  ablations: Ablation[]
-  top_k?: number
-  position?: number
-  max_tokens?: number
-}
-
-/** Mirrors `AblateResponse`. */
-export interface AblateResponse {
-  model_id: string
-  display_name: string
-  tokens: string[]
-  position: number
-  ablations: Ablation[]
-  ablation_label: string
-  baseline: LensTrace
-  ablated: LensTrace
-  effect: AblationEffect
-  narration: string[]
-  truncated: boolean
-  prompt_notice: string | null
-}
-
-/** Mirrors `ComponentEffect` — one component's measured contribution. */
-export interface ComponentEffect {
-  layer: number
+/**
+ * The residual stream is a running sum — every part of the network adds to it
+ * and nothing is overwritten — and the final read-out is linear. So the answer
+ * splits into exactly one number per part, in a single forward pass.
+ */
+export interface Contribution {
+  kind: 'embed' | 'attn' | 'mlp' | 'head'
+  layer: number | null
   head: number | null
   label: string
-  baseline_answer_prob_after: number
-  prob_delta: number
-  kl_bits: number
-  top_token: string
-  top_token_id: number
-  answer_changed: boolean
+  /** Signed push toward the answer, in logits. Negative means it argued against. */
+  logits: number
+  /** `logits` as a fraction of the margin. Exceeds 1 when other parts push back. */
+  share: number
 }
 
-/** Mirrors `AttributionRequest`. `layer` is required when scope is 'heads'. */
 export interface AttributionRequest {
   model_id: string
   prompt: string
-  scope: 'layers' | 'heads'
-  layer?: number
+  contrast_token_id?: number
   position?: number
   max_tokens?: number
 }
 
-/** Mirrors `AttributionResponse`. `components` arrives ranked by kl_bits. */
 export interface AttributionResponse {
   model_id: string
   display_name: string
   tokens: string[]
   position: number
-  scope: 'layers' | 'heads'
-  layer: number | null
-  baseline_answer: TokenPrediction
-  components: ComponentEffect[]
-  runs: number
+  answer: TokenPrediction
+  contrast: TokenPrediction
+  /** answer logit - contrast logit. Every contribution sums into this. */
+  margin: number
+  blocks: Contribution[]
+  heads: Contribution[]
+  unattributed: number
   narration: string[]
   truncated: boolean
-  prompt_notice: string | null
+  prompt_notice?: string | null
 }
 
-/** Mirrors `BehaviorRequest`. Omit `compare_model_id` to just read one model. */
+/** One part of the recipient reverted to the donor's weights. */
+export interface LayerPatch {
+  /** 0-based block index; -1 is the embeddings, block count is the read-out. */
+  layer: number
+  kind: 'embed' | 'block' | 'readout'
+  label: string
+  answer: TokenPrediction
+  donor_answer_prob: number
+  /** 0 = no movement toward the donor, 1 = fully the donor's answer. */
+  recovery: number | null
+  flipped: boolean
+}
+
+export interface PatchFocus {
+  layer: number
+  label: string
+  recipient_text: string
+  donor_text: string
+  patched_text: string
+}
+
+export interface PatchRequest {
+  recipient_model_id: string
+  donor_model_id: string
+  prompt: string
+  layer?: number
+  position?: number
+  max_tokens?: number
+  max_new_tokens?: number
+}
+
+export interface PatchResponse {
+  recipient_model_id: string
+  recipient_name: string
+  donor_model_id: string
+  donor_name: string
+  tokens: string[]
+  position: number
+  recipient_answer: TokenPrediction
+  donor_answer: TokenPrediction
+  agreed: boolean
+  layers: LayerPatch[]
+  best_layer: number | null
+  focus?: PatchFocus | null
+  narration: string[]
+  truncated: boolean
+  prompt_notice?: string | null
+}
+
 export interface BehaviorRequest {
   model_id: string
   compare_model_id?: string
@@ -257,29 +241,3 @@ export interface BehaviorResponse {
 }
 
 /** Mirrors `CompareRequest`. */
-export interface CompareRequest {
-  base_model_id: string
-  finetuned_model_id: string
-  prompt: string
-  max_tokens?: number
-}
-
-/** Mirrors `ModelMagnitudes`. */
-export interface ModelMagnitudes {
-  model_id: string
-  display_name: string
-  hidden_state_magnitudes: number[]
-}
-
-/** Mirrors `CompareResponse`. */
-export interface CompareResponse {
-  prompt: string
-  tokens: string[]
-  base: ModelMagnitudes
-  finetuned: ModelMagnitudes
-  /** finetuned[i] - base[i], over the layers the two models share. */
-  delta: number[]
-  layers_compared: number
-  note: string | null
-  prompt_notice: string | null
-}

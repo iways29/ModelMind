@@ -13,26 +13,24 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from . import inference, models
 from .schemas import (
-    AblateRequest,
-    AblateResponse,
     AnalyzeRequest,
     AnalyzeResponse,
     AttributionRequest,
     AttributionResponse,
     BehaviorRequest,
     BehaviorResponse,
-    CompareRequest,
-    CompareResponse,
     LensRequest,
     LensResponse,
     ModelInfo,
+    PatchRequest,
+    PatchResponse,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
 app = FastAPI(
     title="Model Internals Viz",
-    description="Attention and activation internals for GPT-2 family checkpoints.",
+    description="Behaviour diffs, layer traces, and causal attribution for GPT-2 family checkpoints.",
     version="1.0.0",
 )
 
@@ -98,45 +96,45 @@ def post_lens(request: LensRequest) -> LensResponse:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
-@app.post("/ablate", response_model=AblateResponse)
-def post_ablate(request: AblateRequest) -> AblateResponse:
-    """Switch components off, re-run, and diff against the intact model."""
+@app.post("/attribution", response_model=AttributionResponse)
+def post_attribution(request: AttributionRequest) -> AttributionResponse:
+    """Split the answer into one contribution per component, in a single pass."""
     try:
-        return inference.ablate(
+        return inference.attribution(
             request.model_id,
             request.prompt,
-            request.ablations,
-            top_k=request.top_k,
+            contrast_token_id=request.contrast_token_id,
             position=request.position,
             max_tokens=request.max_tokens,
         )
     except models.UnknownModelError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except (inference.EmptyPromptError, inference.InvalidAblationError) as exc:
+    except inference.EmptyPromptError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    except (inference.LensUnsupportedError, inference.AblationUnsupportedError) as exc:
+    except (inference.LensUnsupportedError, inference.ComponentUnsupportedError) as exc:
         raise HTTPException(status_code=501, detail=str(exc)) from exc
     except inference.ModelLoadError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
-@app.post("/attribution", response_model=AttributionResponse)
-def post_attribution(request: AttributionRequest) -> AttributionResponse:
-    """Ablate every block, or every head in one block, and rank them by effect."""
+@app.post("/patch", response_model=PatchResponse)
+def post_patch(request: PatchRequest) -> PatchResponse:
+    """Splice each of the donor's blocks into the recipient and measure the effect."""
     try:
-        return inference.attribution(
-            request.model_id,
+        return inference.patch(
+            request.recipient_model_id,
+            request.donor_model_id,
             request.prompt,
-            scope=request.scope,
             layer=request.layer,
             position=request.position,
             max_tokens=request.max_tokens,
+            max_new_tokens=request.max_new_tokens,
         )
     except models.UnknownModelError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except (inference.EmptyPromptError, inference.InvalidAblationError) as exc:
+    except (inference.EmptyPromptError, inference.PatchIncompatibleError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    except inference.AblationUnsupportedError as exc:
+    except inference.ComponentUnsupportedError as exc:
         raise HTTPException(status_code=501, detail=str(exc)) from exc
     except inference.ModelLoadError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
@@ -151,24 +149,6 @@ def post_behavior(request: BehaviorRequest) -> BehaviorResponse:
             request.prompts,
             compare_model_id=request.compare_model_id,
             max_new_tokens=request.max_new_tokens,
-        )
-    except models.UnknownModelError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except inference.EmptyPromptError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    except inference.ModelLoadError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-
-
-@app.post("/compare", response_model=CompareResponse)
-def post_compare(request: CompareRequest) -> CompareResponse:
-    """Run two models on the same prompt; return both activation profiles and their delta."""
-    try:
-        return inference.compare(
-            request.base_model_id,
-            request.finetuned_model_id,
-            request.prompt,
-            request.max_tokens,
         )
     except models.UnknownModelError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc

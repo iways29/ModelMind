@@ -1,18 +1,19 @@
 /**
- * Single-page composition: prompt composer at the top, one analysis run
- * feeding the Attention and Activation panels, and a self-contained Compare
- * panel that shares the prompt.
+ * Single-page composition: prompt composer at the top, one analysis run feeding
+ * the lens and attention panels, and a self-contained cause panel that shares
+ * the prompt and runs its own passes.
+ *
+ * The tab order is the order you'd actually work in — find a prompt where
+ * something is wrong, watch the answer form, then find what caused it.
  */
 
 import { useEffect, useState } from 'react'
 
 import { analyze, API_BASE_URL, fetchModels, lens } from './api/client'
 import type { AnalyzeResponse, LensResponse, ModelInfo } from './api/types'
-import AblationView from './components/AblationView'
-import ActivationChart from './components/ActivationChart'
 import AttentionHeatmap from './components/AttentionHeatmap'
 import BehaviorView from './components/BehaviorView'
-import CompareView from './components/CompareView'
+import CauseView from './components/CauseView'
 import LogitLens from './components/LogitLens'
 import ModelSelector from './components/ModelSelector'
 import { Button, ErrorNote, Note } from './components/ui'
@@ -22,10 +23,8 @@ import { Button, ErrorNote, Note } from './components/ui'
 const TABS = [
   { id: 'behavior', label: 'Behavior' },
   { id: 'lens', label: 'Watch it think' },
-  { id: 'ablate', label: 'Ablate' },
+  { id: 'cause', label: 'Find the cause' },
   { id: 'attention', label: 'Attention' },
-  { id: 'activations', label: 'Activations' },
-  { id: 'compare', label: 'Compare' },
 ] as const
 
 type TabId = (typeof TABS)[number]['id']
@@ -194,14 +193,8 @@ export default function App() {
             />
           )}
           {tab === 'lens' && <LogitLens result={lensResult} />}
-          {tab === 'ablate' && (
-            <AblationView modelId={modelId} prompt={prompt} analysis={result} />
-          )}
+          {tab === 'cause' && <CauseView models={models} modelId={modelId} prompt={prompt} />}
           {tab === 'attention' && <AttentionHeatmap result={result} />}
-          {tab === 'activations' && <ActivationChart result={result} />}
-          {tab === 'compare' && (
-            <CompareView models={models} prompt={prompt} onPromptChange={setPrompt} />
-          )}
         </main>
 
         <footer className="mt-14 flex flex-wrap items-center justify-between gap-3 border-t border-line pt-6 font-mono text-[10px] text-ink-faint">
@@ -235,7 +228,7 @@ function Header({ modelCount }: { modelCount: number }) {
             Model Internals
           </h1>
           <p className="mt-0.5 text-[12px] text-ink-faint">
-            Attention maps and activation profiles for GPT-2 family checkpoints
+            Find what your fine-tune changed, and which part of the model changed it
           </p>
         </div>
       </div>
